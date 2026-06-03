@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HEXSOON 450 — Utils</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body style="padding: 20px; max-width: 1400px; margin: 0 auto;">
+
+    <div class="header-container">
+        <h1>HEXSOON 450 <span style="font-size: 18px; color: #555;">GPS-DENIED FLIGHT OPERATIONS</span></h1>
+        <div style="margin-left: auto; text-align: right;">
+            <div id="sys-clock" style="font-size: 18px; font-weight: bold;">--:--:--</div>
+            <div id="ros-status-pill" class="error" style="margin-top: 5px;">
+                <span id="ros-status-text">DISCONNECTED</span>
+            </div>
+        </div>
+    </div>
+
+    <nav class="navbar">
+        <a href="index.html" class="nav-link">MISSION CONTROL</a>
+        <a href="flight_tests.html" class="nav-link">FLIGHT TESTS</a>
+        <a href="history.html" class="nav-link">HISTORY</a>
+        <a href="system.html" class="nav-link">SYSTEM</a>
+        <a href="utils.html" class="nav-link active">UTILS</a>
+    </nav>
+
+    <div class="utils-grid">
+
+        <div class="config-category">
+            <h2>UNIT CONVERTER</h2>
+            <div class="utils-converter">
+                <div class="ft-input-group">
+                    <label>Value</label>
+                    <input type="number" id="conv-input" value="1" step="any"
+                        style="width: 100px; padding: 6px; border: 1px solid #000; font-family: inherit; font-size: 15px; text-align: center;" />
+                </div>
+                <div class="ft-input-group">
+                    <label>Conversion</label>
+                    <select id="conv-type" style="padding: 6px; border: 1px solid #000; font-family: inherit; font-size: 14px;">
+                        <optgroup label="Distance">
+                            <option value="m_ft">m → ft</option>
+                            <option value="ft_m">ft → m</option>
+                            <option value="m_km">m → km</option>
+                            <option value="km_m">km → m</option>
+                            <option value="m_mi">m → miles</option>
+                            <option value="mi_m">miles → m</option>
+                        </optgroup>
+                        <optgroup label="Speed">
+                            <option value="ms_kn">m/s → knots</option>
+                            <option value="kn_ms">knots → m/s</option>
+                            <option value="ms_mph">m/s → mph</option>
+                            <option value="mph_ms">mph → m/s</option>
+                            <option value="ms_kmh">m/s → km/h</option>
+                            <option value="kmh_ms">km/h → m/s</option>
+                        </optgroup>
+                        <optgroup label="Angle">
+                            <option value="deg_rad">deg → rad</option>
+                            <option value="rad_deg">rad → deg</option>
+                        </optgroup>
+                        <optgroup label="Temperature">
+                            <option value="c_f">°C → °F</option>
+                            <option value="f_c">°F → °C</option>
+                            <option value="c_k">°C → K</option>
+                            <option value="k_c">K → °C</option>
+                        </optgroup>
+                        <optgroup label="Pressure">
+                            <option value="pa_hpa">Pa → hPa</option>
+                            <option value="hpa_pa">hPa → Pa</option>
+                            <option value="pa_psi">Pa → psi</option>
+                            <option value="psi_pa">psi → Pa</option>
+                        </optgroup>
+                        <optgroup label="Weight">
+                            <option value="kg_lb">kg → lb</option>
+                            <option value="lb_kg">lb → kg</option>
+                            <option value="g_oz">g → oz</option>
+                            <option value="oz_g">oz → g</option>
+                        </optgroup>
+                    </select>
+                </div>
+                <div class="ft-input-group">
+                    <label>Result</label>
+                    <div id="conv-result"
+                        style="font-size: 20px; font-weight: bold; padding: 6px 0; min-width: 140px;">—</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="config-category utils-cmd-card">
+            <h2>MAV CONSOLE COMMANDS</h2>
+            <p style="font-size: 13px; color: #555; margin-bottom: 12px;">
+                Commands available in the MAV Command Console on the Dashboard and Flight Tests pages.
+            </p>
+            <table class="config-table utils-cmd-table">
+                <thead>
+                    <tr>
+                        <th>COMMAND</th>
+                        <th>SYNTAX</th>
+                        <th>DESCRIPTION</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>arm</code></td>
+                        <td><code>arm</code></td>
+                        <td>Arms the vehicle</td>
+                    </tr>
+                    <tr>
+                        <td><code>disarm</code></td>
+                        <td><code>disarm</code></td>
+                        <td>Disarms the vehicle</td>
+                    </tr>
+                    <tr>
+                        <td><code>mode</code></td>
+                        <td><code>mode &lt;MODE&gt;</code></td>
+                        <td>Sets MAVROS flight mode. E.g. <code>mode GUIDED</code>, <code>mode LOITER</code>, <code>mode LAND</code>, <code>mode STABILIZE</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>takeoff</code></td>
+                        <td><code>takeoff &lt;alt_m&gt;</code></td>
+                        <td>Takeoff to altitude in metres. E.g. <code>takeoff 2.5</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>land</code></td>
+                        <td><code>land</code></td>
+                        <td>Commands the vehicle to land at the current position</td>
+                    </tr>
+                    <tr>
+                        <td><code>move</code></td>
+                        <td><code>move &lt;x&gt; &lt;y&gt; &lt;z&gt;</code></td>
+                        <td>Publishes a local ENU setpoint. E.g. <code>move 5 0 2</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>move</code> (yaw)</td>
+                        <td><code>move &lt;x&gt; &lt;y&gt; &lt;z&gt; &lt;yaw&gt;</code></td>
+                        <td>Move to position with heading in degrees. E.g. <code>move 5 0 2 90</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>help</code></td>
+                        <td><code>help</code></td>
+                        <td>Prints this command list to the console</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-category utils-cmd-card">
+            <h2>FLIGHT TEST COMMANDS</h2>
+            <p style="font-size: 13px; color: #555; margin-bottom: 12px;">
+                Commands sent by the Flight Tests page over WebSocket. Can also be typed into any MAV console.
+            </p>
+            <table class="config-table utils-cmd-table">
+                <thead>
+                    <tr>
+                        <th>COMMAND</th>
+                        <th>SYNTAX</th>
+                        <th>DESCRIPTION</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>quick_land</code></td>
+                        <td><code>quick_land:&lt;alt_m&gt;</code></td>
+                        <td>Test 1 — Arm → takeoff to <em>alt_m</em> → land. E.g. <code>quick_land:2.5</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>hover</code></td>
+                        <td><code>hover:&lt;sec&gt;:&lt;alt_m&gt;</code></td>
+                        <td>Test 2 — Arm → takeoff → hover for <em>sec</em> seconds → land. E.g. <code>hover:30:3</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>move_return</code></td>
+                        <td><code>move_return:&lt;alt_m&gt;:&lt;dist_m&gt;</code></td>
+                        <td>Test 3 — Arm → takeoff → fly <em>dist_m</em> forward (+X ENU) → return → land. E.g. <code>move_return:2:10</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>search</code></td>
+                        <td><code>search:&lt;type&gt;:&lt;alt_m&gt;:&lt;w_m&gt;:&lt;h_m&gt;:&lt;lane_m&gt;:&lt;corner&gt;:&lt;end_behavior&gt;:&lt;rover_id&gt;</code></td>
+                        <td>Full Search Mission — Arm → takeoff → fly search pattern covering width×height area from a starting corner, searching for ArUco marker. Types: <code>spiral</code>, <code>lawnmower</code>, <code>sar</code>. Corners: <code>bl</code>, <code>br</code>, <code>tl</code>, <code>tr</code>. End Behaviors: <code>land_target</code>, <code>land_rover</code>. E.g. <code>search:lawnmower:2:10:10:1.0:tl:land_target:0</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>preview_search</code></td>
+                        <td><code>preview_search:&lt;type&gt;:&lt;alt_m&gt;:&lt;w_m&gt;:&lt;h_m&gt;:&lt;lane_m&gt;:&lt;corner&gt;:&lt;end_behavior&gt;:&lt;rover_id&gt;</code></td>
+                        <td>Generate and preview the search pattern without taking off.</td>
+                    </tr>
+                    <tr>
+                        <td><code>abort</code></td>
+                        <td><code>abort</code></td>
+                        <td>Abort any running flight test and command an immediate land</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-category utils-cmd-card">
+            <h2>ROS 2 QUICK REFERENCE</h2>
+            <p style="font-size: 13px; color: #555; margin-bottom: 12px;">
+                Common ROS 2 CLI commands for use on the companion computer.
+            </p>
+            <table class="config-table utils-cmd-table">
+                <thead>
+                    <tr>
+                        <th>COMMAND</th>
+                        <th>DESCRIPTION</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>ros2 node list</code></td>
+                        <td>List all active ROS 2 nodes</td>
+                    </tr>
+                    <tr>
+                        <td><code>ros2 topic list</code></td>
+                        <td>List all active topics</td>
+                    </tr>
+                    <tr>
+                        <td><code>ros2 topic echo &lt;topic&gt;</code></td>
+                        <td>Print live messages from a topic</td>
+                    </tr>
+                    <tr>
+                        <td><code>ros2 topic hz &lt;topic&gt;</code></td>
+                        <td>Show publish rate of a topic</td>
+                    </tr>
+                    <tr>
+                        <td><code>ros2 topic info &lt;topic&gt;</code></td>
+                        <td>Show type, publishers, and subscribers</td>
+                    </tr>
+                    <tr>
+                        <td><code>ros2 param list</code></td>
+                        <td>List all node parameters</td>
+                    </tr>
+                    <tr>
+                        <td><code>ros2 service list</code></td>
+                        <td>List available services</td>
+                    </tr>
+                    <tr>
+                        <td><code>ros2 launch &lt;pkg&gt; &lt;file.py&gt;</code></td>
+                        <td>Launch a package launch file</td>
+                    </tr>
+                    <tr>
+                        <td><code>colcon build --packages-select &lt;pkg&gt;</code></td>
+                        <td>Build a specific package only</td>
+                    </tr>
+                    <tr>
+                        <td><code>source install/setup.bash</code></td>
+                        <td>Source the workspace after a build</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-category utils-cmd-card">
+            <h2>KEY TOPICS</h2>
+            <p style="font-size: 13px; color: #555; margin-bottom: 12px;">
+                Main ROS 2 topics used by this system.
+            </p>
+            <table class="config-table utils-cmd-table">
+                <thead>
+                    <tr>
+                        <th>TOPIC</th>
+                        <th>TYPE</th>
+                        <th>DIRECTION</th>
+                        <th>DESCRIPTION</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>/mavros/state</code></td><td><code>mavros_msgs/State</code></td><td>← SUB</td><td>Armed, mode, system status</td></tr>
+                    <tr><td><code>/mavros/local_position/pose</code></td><td><code>geometry_msgs/PoseStamped</code></td><td>← SUB</td><td>EKF local pose (x, y, z, orientation)</td></tr>
+                    <tr><td><code>/mavros/local_position/odom</code></td><td><code>nav_msgs/Odometry</code></td><td>← SUB</td><td>VIO odometry for dashboard display</td></tr>
+                    <tr><td><code>/mavros/local_position/velocity_local</code></td><td><code>geometry_msgs/TwistStamped</code></td><td>← SUB</td><td>Local velocity (used for tag tracking)</td></tr>
+                    <tr><td><code>/mavros/global_position/rel_alt</code></td><td><code>std_msgs/Float64</code></td><td>← SUB</td><td>Barometric relative altitude</td></tr>
+                    <tr><td><code>/mavros/global_position/global</code></td><td><code>sensor_msgs/NavSatFix</code></td><td>← SUB</td><td>GPS lat/lon/alt</td></tr>
+                    <tr><td><code>/mavros/global_position/compass_hdg</code></td><td><code>std_msgs/Float64</code></td><td>← SUB</td><td>Compass heading (degrees)</td></tr>
+                    <tr><td><code>/mavros/battery</code></td><td><code>sensor_msgs/BatteryState</code></td><td>← SUB</td><td>Battery voltage, current, percentage</td></tr>
+                    <tr><td><code>/mavros/vision_pose/pose</code></td><td><code>geometry_msgs/PoseStamped</code></td><td>← SUB</td><td>VIO liveness monitor</td></tr>
+                    <tr><td><code>/mavros/setpoint_position/local</code></td><td><code>geometry_msgs/PoseStamped</code></td><td>→ PUB</td><td>Position setpoints to flight controller</td></tr>
+                    <tr><td><code>/map</code></td><td><code>nav_msgs/OccupancyGrid</code></td><td>← SUB</td><td>RTAB-Map 2D occupancy grid</td></tr>
+                    <tr><td><code>/flight_test/command</code></td><td><code>std_msgs/String</code></td><td>→ PUB</td><td>Send test commands to flight_tests node</td></tr>
+                    <tr><td><code>/flight_test/status</code></td><td><code>std_msgs/String</code></td><td>← SUB</td><td>Human-readable status from active test</td></tr>
+                    <tr><td><code>/flight_test/plan</code></td><td><code>std_msgs/String (JSON)</code></td><td>← SUB</td><td>Waypoint plan, active index, UAV pos, marker pos</td></tr>
+                    <tr><td><code>/flight_test/aruco_tag</code></td><td><code>std_msgs/String (JSON)</code></td><td>← SUB</td><td>Confirmed ArUco tag world position <code>{id,x,y}</code></td></tr>
+                    <tr><td><code>/flight_test/event</code></td><td><code>std_msgs/String (JSON)</code></td><td>← SUB</td><td>Mission lifecycle events <code>{type,...}</code></td></tr>
+                    <tr><td><code>/flight_test/run_state</code></td><td><code>std_msgs/String</code></td><td>← SUB</td><td><code>START: &lt;name&gt;</code> / <code>END</code> for logger</td></tr>
+                    <tr><td><code>/camera/annotated/compressed</code></td><td><code>sensor_msgs/CompressedImage</code></td><td>← SUB</td><td>JPEG annotated camera frame with ArUco overlays</td></tr>
+                    <tr><td><code>/uav_logger/log</code></td><td><code>std_msgs/String (JSON)</code></td><td>← SUB</td><td>Structured log entries from mission logger</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-category utils-cmd-card" style="grid-column: 1 / -1;">
+            <h2>HTTP REST API</h2>
+            <p style="font-size: 13px; color: #555; margin-bottom: 12px;">
+                HTTP endpoints served on port <strong>8000</strong>. All responses include <code>Access-Control-Allow-Origin: *</code>.
+            </p>
+            <table class="config-table utils-cmd-table">
+                <thead>
+                    <tr><th>ENDPOINT</th><th>METHOD</th><th>RESPONSE</th><th>DESCRIPTION</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>/api/map</code></td>
+                        <td>GET</td>
+                        <td><code>image/png</code> or <code>application/json</code></td>
+                        <td>
+                            Latest RTAB-Map occupancy grid as a PNG image.<br>
+                            <em>Color: white = free, black = occupied, gray = unknown.</em><br>
+                            Map metadata in headers: <code>X-Map-Resolution</code>, <code>X-Map-Origin-X</code>, <code>X-Map-Origin-Y</code>, <code>X-Map-Width</code>, <code>X-Map-Height</code>.<br>
+                            Returns <code>503</code> JSON if no map received yet. Falls back to JSON if cv2 unavailable.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><code>/api/aruco_tags</code></td>
+                        <td>GET</td>
+                        <td><code>application/json</code></td>
+                        <td>
+                            All ArUco tags detected since node start.<br>
+                            <pre style="margin:4px 0;font-size:12px;">{
+  "tags": [
+    {
+      "id": 42,
+      "x": 1.83,        // ENU local frame (m)
+      "y": -0.47,
+      "ts": 1744742310.214,
+      "map_x": 3.21,    // metres from map origin
+      "map_y": 2.85,
+      "px": 64.2,       // pixel in /api/map PNG
+      "py": 117.5
+    }
+  ]
+}</pre>
+                            <code>map_x/y/px/py</code> omitted if no map received yet.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><code>/api/system</code></td>
+                        <td>GET</td>
+                        <td><code>application/json</code></td>
+                        <td>Host system info: hostname, kernel, uptime, load, RAM, disk, CPU, network interfaces, gateway reachability, ROS node and topic counts.</td>
+                    </tr>
+                    <tr>
+                        <td><code>/api/logs/runs</code></td>
+                        <td>GET</td>
+                        <td><code>application/json</code></td>
+                        <td>List of past mission run log files from <code>~/.ros/uav_logs/runs/</code>. Each entry includes <code>id</code>, <code>name</code>, <code>date</code>, <code>time</code>, <code>txt_url</code>, <code>jsonl_url</code>, <code>video_url</code>.</td>
+                    </tr>
+                    <tr>
+                        <td><code>/logs/&lt;path&gt;</code></td>
+                        <td>GET</td>
+                        <td><code>text/plain</code> or <code>video/mp4</code></td>
+                        <td>Serves <code>.txt</code>, <code>.jsonl</code>, or <code>.mp4</code> files from <code>~/.ros/uav_logs/</code>. Path traversal is blocked.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-category utils-cmd-card" style="grid-column: 1 / -1;">
+            <h2>WEBSOCKET EVENTS — OUTBOUND (server → client)</h2>
+            <p style="font-size: 13px; color: #555; margin-bottom: 12px;">
+                Connect to <code>ws://&lt;ip&gt;:9090</code>. All frames are JSON <code>{"type": "...", "data": {...}}</code>.
+            </p>
+            <table class="config-table utils-cmd-table">
+                <thead>
+                    <tr><th>TYPE</th><th>DATA FIELDS</th><th>DESCRIPTION</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>aruco_tag</code></td>
+                        <td><pre style="margin:0;font-size:12px;">{
+  id: 42,
+  x: 1.83, y: -0.47,   // ENU (m)
+  ts: 1744742310.214,
+  map_x: 3.21,          // map-relative (m)
+  map_y: 2.85,
+  px: 64.2, py: 117.5  // /api/map pixel
+}</pre></td>
+                        <td>Fired every time an ArUco tag is detected with a computed world position during any test. <code>map_*</code> / <code>px</code> / <code>py</code> present only when RTAB map is available.</td>
+                    </tr>
+                    <tr>
+                        <td><code>search_start</code></td>
+                        <td><pre style="margin:0;font-size:12px;">{
+  pattern: "spiral",
+  alt: 3.0,
+  area_w: 5.0,
+  area_h: 5.0,
+  waypoints: 12,
+  start_x: 1.23,
+  start_y: -0.45
+}</pre></td>
+                        <td>Fired once when a search mission begins flying the pattern (Mission Control + Test 4).</td>
+                    </tr>
+                    <tr>
+                        <td><code>found_aruco_tag</code></td>
+                        <td><pre style="margin:0;font-size:12px;">{
+  id: 42,
+  x: 1.83,
+  y: -0.47
+}</pre></td>
+                        <td>Mission Control only. Fired once after the drone has centered over the target ArUco tag and is hovering, waiting for UGV confirmation. Send <code>ugv_received</code> to proceed.</td>
+                    </tr>
+                    <tr>
+                        <td><code>landed_on_tag</code></td>
+                        <td><pre style="margin:0;font-size:12px;">{
+  id: 42,
+  x: 1.83,
+  y: -0.47
+}</pre></td>
+                        <td>Fired once after the drone confirms touchdown on an ArUco tag (Mission Control rover landing + Tests 4, 5, 6).</td>
+                    </tr>
+                    <tr>
+                        <td><code>mavros_state</code></td>
+                        <td><code>{ system_status, mode, armed }</code></td>
+                        <td>Vehicle arm state and flight mode</td>
+                    </tr>
+                    <tr>
+                        <td><code>mavros_rel_alt</code></td>
+                        <td><code>{ data }</code> — metres</td>
+                        <td>Barometric relative altitude</td>
+                    </tr>
+                    <tr>
+                        <td><code>mavros_heading</code></td>
+                        <td><code>{ data }</code> — degrees</td>
+                        <td>Compass heading</td>
+                    </tr>
+                    <tr>
+                        <td><code>mavros_velocity</code></td>
+                        <td><code>{ vx, vy, vz, ground_speed }</code> — m/s</td>
+                        <td>Local velocity and ground speed</td>
+                    </tr>
+                    <tr>
+                        <td><code>mavros_battery</code></td>
+                        <td><code>{ voltage, current, percentage }</code></td>
+                        <td>Battery state</td>
+                    </tr>
+                    <tr>
+                        <td><code>mavros_gps</code></td>
+                        <td><code>{ latitude, longitude, altitude }</code></td>
+                        <td>Global GPS position</td>
+                    </tr>
+                    <tr>
+                        <td><code>vio_odom</code></td>
+                        <td><code>{ x, y, z, roll, pitch, yaw }</code></td>
+                        <td>VIO local position and orientation (degrees)</td>
+                    </tr>
+                    <tr>
+                        <td><code>vio_status</code></td>
+                        <td><code>{ online: true/false }</code></td>
+                        <td>Whether VIO pose data is fresh (updated 1 Hz)</td>
+                    </tr>
+                    <tr>
+                        <td><code>imu</code></td>
+                        <td><code>{ av: {x,y,z}, la: {x,y,z} }</code></td>
+                        <td>Angular velocity (rad/s) and linear acceleration (m/s²)</td>
+                    </tr>
+                    <tr>
+                        <td><code>camera_frame</code></td>
+                        <td><code>{ data: "&lt;base64 JPEG&gt;" }</code></td>
+                        <td>Annotated camera frame with ArUco overlays</td>
+                    </tr>
+                    <tr>
+                        <td><code>flight_test_status</code></td>
+                        <td><code>{ text: "..." }</code></td>
+                        <td>Human-readable status from the active flight test</td>
+                    </tr>
+                    <tr>
+                        <td><code>flight_plan</code></td>
+                        <td><code>{ waypoints, active, uav, marker? }</code></td>
+                        <td>Current search waypoint plan for map canvas rendering</td>
+                    </tr>
+                    <tr>
+                        <td><code>rosout</code></td>
+                        <td><code>{ tag, node, message }</code></td>
+                        <td>Structured ROS log entries (tags: ROS, MAV, VIO, SYS, ERR)</td>
+                    </tr>
+                    <tr>
+                        <td><code>cmd_response</code></td>
+                        <td><code>{ text: "..." }</code></td>
+                        <td>Response text from a MAV console command</td>
+                    </tr>
+                    <tr>
+                        <td><code>active_camera</code></td>
+                        <td><code>{ text: "cv2: /dev/video6" }</code></td>
+                        <td>Label of the active camera source</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 style="margin-top: 24px;">WEBSOCKET EVENTS — INBOUND (client → server)</h2>
+            <table class="config-table utils-cmd-table" style="margin-top: 10px;">
+                <thead>
+                    <tr><th>TYPE</th><th>DATA</th><th>DESCRIPTION</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>command</code></td>
+                        <td><code>{ data: "arm" }</code></td>
+                        <td>MAV console command string. See MAV Console Commands table above.</td>
+                    </tr>
+                    <tr>
+                        <td><code>flight_test</code></td>
+                        <td><code>{ data: "search:spiral:3:5:5:1:bl:land_target:0:42" }</code></td>
+                        <td>Flight test command string. Forwarded directly to <code>/flight_test/command</code>. See Flight Test Commands table above.</td>
+                    </tr>
+                    <tr>
+                        <td><code>ugv_received</code></td>
+                        <td><code>{}</code></td>
+                        <td>Mission Control only. Send after receiving <code>found_aruco_tag</code> to confirm the UGV has acknowledged the target position. The UAV will then leave the hover, return home, and land on the rover if its ArUco tag is acquired en-route.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+
+    <script src="utils.js"></script>
+</body>
+
+</html>

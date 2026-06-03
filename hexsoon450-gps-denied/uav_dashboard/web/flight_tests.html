@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HEXSOON 450 — Flight Tests</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body style="padding: 20px; max-width: 1400px; margin: 0 auto;">
+
+    <div class="header-container">
+        <h1>HEXSOON 450 <span style="font-size: 18px; color: #555;">GPS-DENIED FLIGHT OPERATIONS</span></h1>
+        <div style="margin-left: auto; text-align: right;">
+            <div id="sys-clock" style="font-size: 18px; font-weight: bold;">--:--:--</div>
+            <div id="ros-status-pill" class="error" style="margin-top: 5px;">
+                <span id="ros-status-text">DISCONNECTED</span>
+            </div>
+        </div>
+    </div>
+
+    <nav class="navbar">
+        <a href="index.html" class="nav-link">MISSION CONTROL</a>
+        <a href="flight_tests.html" class="nav-link active">FLIGHT TESTS</a>
+        <a href="history.html" class="nav-link">HISTORY</a>
+        <a href="system.html" class="nav-link">SYSTEM</a>
+        <a href="utils.html" class="nav-link">UTILS</a>
+    </nav>
+
+    <div class="config-category" style="margin-bottom: 10px;">
+        <table class="config-table">
+            <tr>
+                <th>MAV STATE</th>
+                <th>ARMED</th>
+                <th>MODE</th>
+                <th>BATT VOLTAGE</th>
+                <th>REL. ALTITUDE</th>
+                <th>GROUND SPEED</th>
+                <th>VIO TRACK</th>
+            </tr>
+            <tr>
+                <td id="mav-state">—</td>
+                <td id="mav-armed" style="font-weight: bold;">—</td>
+                <td id="mav-mode">—</td>
+                <td id="mav-batt-v">—</td>
+                <td id="mav-alt-rel">–.–– m</td>
+                <td id="mav-spd">–.– m/s</td>
+                <td id="vio-status">OFFLINE</td>
+            </tr>
+        </table>
+    </div>
+
+    <div class="config-category" style="margin-bottom: 10px;">
+        <button class="big-red-btn" id="btn-test-abort">MISSION ABORT</button>
+        <div class="header-container" style="margin-bottom: 0;">
+            <h2 style="margin: 0; border: none; padding-bottom: 0;">FLIGHT TESTS</h2>
+            <div id="flight-test-status" style="font-weight: bold; flex: 1; padding-left: 20px;">Ready</div>
+        </div>
+    </div>
+
+    <div class="ft-test-grid">
+
+        <div class="config-category test-card">
+            <h3>TEST 1 — QUICK TAKEOFF &amp; LAND</h3>
+            <p>Pushes a takeoff mission, switches to AUTO mode, climbs to the specified altitude, then lands. Verifies arming, mission execution, and landing in GPS-denied AUTO mode.</p>
+            <div class="ft-inputs">
+                <div class="ft-input-group">
+                    <label>Altitude</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="quick-altitude" value="1" min="0.5" max="1" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+            </div>
+            <button class="edit-btn ft-run-btn" id="btn-test-quick">RUN TEST 1</button>
+        </div>
+
+        <div class="config-category test-card">
+            <h3>TEST 2 — HOVER</h3>
+            <p>Pushes a takeoff mission (AUTO), climbs to altitude, switches to GUIDED for position hold, hovers for the set duration, then lands.</p>
+            <div class="ft-inputs">
+                <div class="ft-input-group">
+                    <label>Altitude</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="hover-altitude" value="1" min="0.5" max="1" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Duration</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="hover-duration" value="10" min="1" max="120" />
+                        <span>sec</span>
+                    </div>
+                </div>
+            </div>
+            <button class="edit-btn ft-run-btn" id="btn-test-hover">RUN TEST 2</button>
+        </div>
+
+        <div class="config-category test-card">
+            <h3>TEST 3 — MOVE &amp; RETURN</h3>
+            <p>AUTO takeoff, then GUIDED mode: flies the set distance forward (+X), returns to origin, then lands. Verifies position control with VIO.</p>
+            <div class="ft-inputs">
+                <div class="ft-input-group">
+                    <label>Altitude</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="move-altitude" value="1" min="0.5" max="1" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Distance</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="move-distance" value="1" min="0.5" max="3" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+            </div>
+            <button class="edit-btn ft-run-btn" id="btn-test-move">RUN TEST 3</button>
+        </div>
+
+        <div class="config-category test-card">
+            <h3>TEST 4 — SEARCH &amp; LAND</h3>
+            <p>Flies the selected search pattern and lands on the first detection of the specified ArUco target ID. The landing procedure begins immediately on detection.</p>
+            <div class="ft-inputs">
+                <div class="ft-input-group">
+                    <label>Target ID</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-target-id" value="0" min="0" max="249" step="1" />
+                        <span>ArUco</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Pattern</label>
+                    <div class="ft-input-row">
+                        <select id="search-pattern" style="font-family: inherit; font-size: inherit; padding: 2px 4px;">
+                            <option value="spiral">Spiral</option>
+                            <option value="lawnmower">Lawnmower</option>
+                            <option value="sar">SAR (Sector Search)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Altitude</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-altitude" value="3" min="1" max="6" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Area W</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-area-w" value="5" min="1" max="20" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Area H</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-area-h" value="5" min="1" max="20" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Spacing</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-spacing" value="1.0" min="0.5" max="5" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+            </div>
+            <button class="edit-btn ft-run-btn" id="btn-test-search">RUN TEST 4</button>
+        </div>
+
+        <div class="config-category test-card">
+            <h3>TEST 5 — ACTIVE ARUCO FOLLOW</h3>
+            <p>Hovers and locks onto the selected ArUco target ID, tracking it continuously. Click LAND below to initiate the active descent landing sequence onto the tag.</p>
+            <div class="ft-inputs">
+                <div class="ft-input-group">
+                    <label>Target ID</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="follow-target-id" value="0" min="0" max="249" step="1" />
+                        <span>ArUco</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Altitude</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="follow-altitude" value="2" min="1" max="6" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+            </div>
+            <div style="display: flex; gap: 10px; margin-top: 15px;">
+                <button class="edit-btn ft-run-btn" style="flex: 1;" id="btn-test-follow">START FOLLOW</button>
+                <button class="edit-btn ft-run-btn" style="flex: 1; background-color: #e67e22;" id="btn-test-land">LAND ON TAG</button>
+            </div>
+        </div>
+
+        <div class="config-category test-card">
+            <h3>TEST 6 — TIMED ARUCO FOLLOW &amp; LAND</h3>
+            <p>Same as Test 5 — follows the ArUco tag continuously at the set altitude — but automatically initiates the stepped landing sequence onto the tag after the set duration expires.</p>
+            <div class="ft-inputs">
+                <div class="ft-input-group">
+                    <label>Target ID</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="follow-timed-target-id" value="0" min="0" max="249" step="1" />
+                        <span>ArUco</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Altitude</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="follow-timed-altitude" value="2" min="1" max="6" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Duration</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="follow-timed-duration" value="30" min="5" max="300" step="5" />
+                        <span>sec</span>
+                    </div>
+                </div>
+            </div>
+            <button class="edit-btn ft-run-btn" id="btn-test-follow-timed">RUN TEST 6</button>
+        </div>
+
+        <div class="config-category test-card">
+            <h3>TEST 7 — SEARCH, HOVER &amp; ROVER LAND</h3>
+            <p>Searches the area for the target ArUco tag, centers over it and hovers for the set duration, then returns home. On the way home, if the rover tag is visible the drone follows and lands on it.</p>
+            <div class="ft-inputs">
+                <div class="ft-input-group">
+                    <label>Pattern</label>
+                    <div class="ft-input-row">
+                        <select id="search-hover-pattern" style="font-family: inherit; font-size: inherit; padding: 2px 4px;">
+                            <option value="spiral">Spiral</option>
+                            <option value="lawnmower">Lawnmower</option>
+                            <option value="sar">SAR (Sector Search)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Altitude</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-hover-altitude" value="3" min="1" max="6" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Area W</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-hover-area-w" value="5" min="1" max="20" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Area H</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-hover-area-h" value="5" min="1" max="20" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Spacing</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-hover-spacing" value="1.0" min="0.5" max="5" step="0.5" />
+                        <span>m</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Hover</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-hover-duration" value="10" min="1" max="120" step="1" />
+                        <span>sec</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Rover ID</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-hover-rover-id" value="0" min="0" max="249" step="1" />
+                        <span>ArUco</span>
+                    </div>
+                </div>
+                <div class="ft-input-group">
+                    <label>Target ID</label>
+                    <div class="ft-input-row">
+                        <input type="number" id="search-hover-target-id" value="-1" min="-1" max="249" step="1" />
+                        <span>ArUco</span>
+                    </div>
+                </div>
+            </div>
+            <button class="edit-btn ft-run-btn" id="btn-test-search-hover">RUN TEST 7</button>
+        </div>
+
+    </div>
+
+    <div class="ft-bottom-grid">
+
+        <div class="ft-bottom-left">
+            <div class="config-category">
+                <h2>MAV COMMAND CONSOLE</h2>
+                <div class="console-box">
+                    <div id="console-output" class="console-output"></div>
+                    <div class="console-input-row">
+                        <span class="console-prompt">&gt;</span>
+                        <input type="text" id="console-input" class="console-input"
+                            placeholder="Type a command... (help for list)" autocomplete="off" spellcheck="false" />
+                        <button class="edit-btn" id="console-send">SEND</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="config-category">
+                <div class="header-container" style="margin-bottom: 0;">
+                    <h2 style="margin: 0; border: none; padding-bottom: 0;">SYSTEM EVENT LOG</h2>
+                    <button class="delete-btn" id="btn-clear-log">CLEAR</button>
+                </div>
+                <div class="tables-container">
+                    <div class="table-wrapper" style="max-height: 300px; overflow-y: auto; border: 1px solid #000;">
+                        <table class="config-table" id="event-log" style="margin-top: 0;">
+                            <thead>
+                                <tr>
+                                    <th style="width: 120px;">TIME</th>
+                                    <th style="width: 80px;">TAG</th>
+                                    <th>MESSAGE</th>
+                                </tr>
+                            </thead>
+                            <tbody id="log-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="ft-bottom-right">
+            <div class="config-category">
+                <h2>CAMERA FEED</h2>
+                <img id="camera-feed"
+                    style="width:100%;border:1px solid #333;background:#111;display:block;min-height:180px;"
+                    alt="No camera feed" />
+            </div>
+
+            <div class="config-category">
+                <h2>VIO LOCAL POSITION</h2>
+                <div class="tables-container">
+                    <div class="table-wrapper">
+                        <table class="config-table">
+                            <tr>
+                                <th>POS X</th>
+                                <td id="pos-x">0.000 m</td>
+                            </tr>
+                            <tr>
+                                <th>POS Y</th>
+                                <td id="pos-y">0.000 m</td>
+                            </tr>
+                            <tr>
+                                <th>POS Z</th>
+                                <td id="pos-z">0.000 m</td>
+                            </tr>
+                            <tr>
+                                <th>ROLL</th>
+                                <td id="ori-r">0.0°</td>
+                            </tr>
+                            <tr>
+                                <th>PITCH</th>
+                                <td id="ori-p">0.0°</td>
+                            </tr>
+                            <tr>
+                                <th>YAW</th>
+                                <td id="ori-y">0.0°</td>
+                            </tr>
+                            <tr>
+                                <th>HEADING</th>
+                                <td id="mav-heading">–––°</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <script src="flight_tests.js"></script>
+</body>
+
+</html>

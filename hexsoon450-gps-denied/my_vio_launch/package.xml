@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypelayout="1.0"?>
+<package format="3">
+  <name>my_vio_launch</name>
+  <version>0.0.0</version>
+  <description>Launch files for the Hexsoon 450 VIO + MAVROS + dashboard stack</description>
+  <maintainer email="pi@todo.todo">pi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!--
+    launch infrastructure (needed to import from Python launch files)
+  -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- Intel RealSense camera driver -->
+  <exec_depend>realsense2_camera</exec_depend>
+
+  <!-- RTAB-Map examples launch included by rtab_map.launch.py -->
+  <exec_depend>rtabmap_examples</exec_depend>
+  <exec_depend>rtabmap_ros</exec_depend>
+
+  <!-- open_vins / ov_msckf removed: stack uses RTAB-Map, not OpenVINS -->
+
+  <!-- MAVROS flight controller bridge -->
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>mavros_msgs</exec_depend>
+
+  <!-- topic_tools transform node (PoseWithCovarianceStamped → PoseStamped) -->
+  <exec_depend>topic_tools</exec_depend>
+
+  <!-- ROS 2 message types used by topic_tools transform -->
+  <exec_depend>geometry_msgs</exec_depend>
+
+  <!-- web_video_server MJPEG camera stream -->
+  <exec_depend>web_video_server</exec_depend>
+
+  <!-- UAV web dashboard (included launch — temporary, dev convenience) -->
+  <exec_depend>uav_dashboard</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

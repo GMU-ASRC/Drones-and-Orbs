@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HEXSOON 450 — Mission History</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .history-grid {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .run-list {
+            max-height: 600px;
+            overflow-y: auto;
+            border: 1px solid #333;
+            background: #111;
+        }
+        .run-item {
+            padding: 15px;
+            border-bottom: 1px solid #333;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .run-item:hover {
+            background: #222;
+        }
+        .run-item.active {
+            background: #004400;
+            border-left: 4px solid #00ff00;
+        }
+        .run-name {
+            font-weight: bold;
+            font-size: 16px;
+            color: #fff;
+            margin-bottom: 5px;
+        }
+        .run-date {
+            font-size: 12px;
+            color: #aaa;
+        }
+        .log-viewer {
+            width: 100%;
+            height: 300px;
+            background: #111;
+            color: #0f0;
+            border: 1px solid #333;
+            padding: 10px;
+            font-family: monospace;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        .video-container {
+            width: 100%;
+            margin-top: 20px;
+            background: #000;
+            border: 1px solid #333;
+            min-height: 300px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .video-container video {
+            width: 100%;
+            max-height: 600px;
+        }
+        .empty-message {
+            color: #666;
+            text-align: center;
+            padding: 40px;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body style="padding: 20px; max-width: 1400px; margin: 0 auto;">
+
+    <div class="header-container">
+        <h1>HEXSOON 450 <span style="font-size: 18px; color: #555;">GPS-DENIED FLIGHT OPERATIONS</span></h1>
+        <div style="margin-left: auto; text-align: right;">
+            <div id="sys-clock" style="font-size: 18px; font-weight: bold;">--:--:--</div>
+        </div>
+    </div>
+
+    <nav class="navbar">
+        <a href="index.html" class="nav-link">MISSION CONTROL</a>
+        <a href="flight_tests.html" class="nav-link">FLIGHT TESTS</a>
+        <a href="history.html" class="nav-link active">HISTORY</a>
+        <a href="system.html" class="nav-link">SYSTEM</a>
+        <a href="utils.html" class="nav-link">UTILS</a>
+    </nav>
+
+    <div class="history-grid">
+        <div class="config-category">
+            <h2>PAST MISSIONS</h2>
+            <div class="run-list" id="run-list">
+                <div class="empty-message">Loading runs...</div>
+            </div>
+            <button class="edit-btn" id="btn-refresh" style="margin-top: 15px; width: 100%;">REFRESH LIST</button>
+        </div>
+
+        <div>
+            <div class="config-category">
+                <div class="header-container" style="margin-bottom: 10px;">
+                    <h2 style="margin: 0; border: none; padding-bottom: 0;">MISSION LOG</h2>
+                    <a id="download-txt" href="#" target="_blank" style="color: #00ff00; text-decoration: none; font-size: 14px; padding-left: 20px; display: none;">[DOWNLOAD TXT]</a>
+                    <a id="download-jsonl" href="#" target="_blank" style="color: #00ff00; text-decoration: none; font-size: 14px; padding-left: 10px; display: none;">[DOWNLOAD JSONL]</a>
+                </div>
+                <div class="log-viewer" id="log-content">Select a mission to view logs.</div>
+            </div>
+
+            <div class="config-category" style="margin-top: 20px;">
+                <div class="header-container" style="margin-bottom: 10px;">
+                    <h2 style="margin: 0; border: none; padding-bottom: 0;">MISSION VIDEO</h2>
+                    <a id="download-video" href="#" target="_blank" style="color: #00ff00; text-decoration: none; font-size: 14px; padding-left: 20px; display: none;">[DOWNLOAD MP4]</a>
+                </div>
+                <div class="video-container" id="video-wrapper">
+                    <div class="empty-message">No video selected</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="history.js"></script>
+</body>
+</html>

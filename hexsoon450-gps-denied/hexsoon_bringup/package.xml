@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypelayout="1.0"?>
+<package format="3">
+  <name>hexsoon_bringup</name>
+  <version>0.0.0</version>
+  <description>Top-level bringup package for the Hexsoon 450 GPS-denied stack</description>
+  <maintainer email="pi@todo.todo">pi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>my_vio_launch</exec_depend>
+  <exec_depend>uav_dashboard</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <!-- ov_msckf removed: OpenVINS is not used; stack uses RTAB-Map for odometry -->
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>mavros_msgs</exec_depend>
+  <exec_depend>topic_tools</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>web_video_server</exec_depend>
+  <exec_depend>flight_tests</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

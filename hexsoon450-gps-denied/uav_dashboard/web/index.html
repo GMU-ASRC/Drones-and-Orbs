@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HEXSOON 450 — Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body style="padding: 20px; max-width: 1400px; margin: 0 auto;">
+
+    <div class="header-container">
+        <h1>HEXSOON 450 <span style="font-size: 18px; color: #555;">GPS-DENIED FLIGHT OPERATIONS</span></h1>
+        <div style="margin-left: auto; text-align: right;">
+            <div id="sys-clock" style="font-size: 18px; font-weight: bold;">--:--:--</div>
+            <div id="ros-status-pill" class="error" style="margin-top: 5px;">
+                <span id="ros-status-text">DISCONNECTED</span>
+            </div>
+        </div>
+    </div>
+
+    <nav class="navbar">
+        <a href="index.html" class="nav-link active">MISSION CONTROL</a>
+        <a href="flight_tests.html" class="nav-link">FLIGHT TESTS</a>
+        <a href="history.html" class="nav-link">HISTORY</a>
+        <a href="system.html" class="nav-link">SYSTEM</a>
+        <a href="utils.html" class="nav-link">UTILS</a>
+    </nav>
+
+    <div class="dashboard-grid">
+        <div class="column-main">
+            <div class="config-category">
+                <h2>SYSTEM STATUS</h2>
+                <div class="tables-container">
+                    <div class="table-wrapper">
+                        <table class="config-table">
+                            <tr>
+                                <th>MAV STATE</th>
+                                <th>ARMED</th>
+                                <th>MODE</th>
+                                <th>BATT VOLTAGE</th>
+                                <th>BATT CURR</th>
+                                <th>VIO TRACK</th>
+                            </tr>
+                            <tr>
+                                <td id="mav-state">—</td>
+                                <td id="mav-armed" style="font-weight: bold;">—</td>
+                                <td id="mav-mode">—</td>
+                                <td id="mav-batt-v">—</td>
+                                <td id="mav-batt-a">—</td>
+                                <td id="vio-status">OFFLINE</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="hardware-box">
+                <h3 style="display: flex; justify-content: space-between;">
+                    LIVE CAMERA FEED
+                    <span id="stream-badge" class="error" style="font-size: 14px; text-decoration: none;">NO
+                        SIGNAL</span>
+                </h3>
+                <div style="font-size: 12px; margin-bottom: 8px; font-weight: bold; color: #555;">
+                    SOURCE: <span id="active-camera" style="color: #000;">Waiting...</span>
+                </div>
+                <div
+                    style="position: relative; border: 1px solid #000; background: #eee; width: 100%; aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center; overflow: hidden;">
+                    <img id="camera-stream" alt="NO SIGNAL"
+                        style="display: none; width: 100%; height: 100%; object-fit: contain;" />
+                    <div id="video-overlay" style="text-align: center;">
+                        <span class="error" style="font-size: 24px;">&#9632; NO SIGNAL</span>
+                    </div>
+                    <div
+                        style="position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.8); padding: 5px; border: 1px solid #000; font-weight: bold;">
+                        <div id="hud-alt">ALT — m</div>
+                        <div id="hud-spd">SPD — m/s</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="config-category test-card" style="margin-top: 15px;">
+                <h3>SEARCH MISSION</h3>
+                <p>AUTO takeoff, then GUIDED search pattern looking for ArUco. When detected, centers and lands on marker. If not found, returns home. <b>You must preview the plan before starting the mission.</b></p>
+                <div class="ft-inputs">
+                    <div class="ft-input-group">
+                        <label>Pattern Type</label>
+                        <select id="search-pattern" style="padding: 5px; background: #fff; color: #000; border: 1px solid #333; height: 30px; font-weight: bold;">
+                            <option value="spiral">Spiral</option>
+                            <option value="lawnmower">Lawnmower</option>
+                            <option value="sar">SAR (Sector Search)</option>
+                        </select>
+                    </div>
+                    <div class="ft-input-group">
+                        <label>Start Corner</label>
+                        <select id="search-corner" style="padding: 5px; background: #fff; color: #000; border: 1px solid #333; height: 30px; font-weight: bold;">
+                            <option value="bl">Bottom-Left (SW)</option>
+                            <option value="br">Bottom-Right (SE)</option>
+                            <option value="tl">Top-Left (NW)</option>
+                            <option value="tr">Top-Right (NE)</option>
+                        </select>
+                    </div>
+                    <div class="ft-input-group">
+                        <label>Altitude</label>
+                        <div class="ft-input-row">
+                            <input type="number" id="search-altitude" value="1" min="0.5" max="1" step="0.5" />
+                            <span>m</span>
+                        </div>
+                    </div>
+                    <div class="ft-input-group">
+                        <label>Area Width</label>
+                        <div class="ft-input-row">
+                            <input type="number" id="search-area-w" value="3" min="1" max="20" step="0.5" />
+                            <span>m</span>
+                        </div>
+                    </div>
+                    <div class="ft-input-group">
+                        <label>Area Height</label>
+                        <div class="ft-input-row">
+                            <input type="number" id="search-area-h" value="3" min="1" max="20" step="0.5" />
+                            <span>m</span>
+                        </div>
+                    </div>
+                    <div class="ft-input-group">
+                        <label>Lane Spacing</label>
+                        <div class="ft-input-row">
+                            <input type="number" id="search-spacing" value="1.0" min="0.5" max="5.0" step="0.1" />
+                            <span>m</span>
+                        </div>
+                    </div>
+                    <div class="ft-input-group">
+                        <label>Rover ArUco ID</label>
+                        <div class="ft-input-row">
+                            <input type="number" id="search-rover-id" value="0" min="0" max="1000" step="1" />
+                        </div>
+                    </div>
+                    <div class="ft-input-group">
+                        <label>Target ArUco ID</label>
+                        <div class="ft-input-row">
+                            <input type="number" id="search-target-id" value="-1" min="-1" max="1000" step="1" />
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 15px;">
+                    <button class="edit-btn ft-run-btn" id="btn-preview-search" style="flex: 1; background-color: #0088cc;">PREVIEW PLAN</button>
+                    <button class="edit-btn ft-run-btn" id="btn-start-search" style="flex: 1;" disabled>START MISSION</button>
+                </div>
+                <button style="margin-top: 10px;" class="big-red-btn" id="btn-test-abort">MISSION ABORT</button>
+            </div>
+
+            <div class="config-category" style="margin-top: 15px;">
+                <div class="header-container" style="margin-bottom: 10px;">
+                    <h2 style="margin: 0; border: none; padding-bottom: 0;">FLIGHT PLAN</h2>
+                    <div id="flight-test-status" style="font-weight: bold; flex: 1; padding-left: 20px;">Ready</div>
+                </div>
+                <span id="plan-info" style="font-size: 12px; color: #555;">No active plan</span>
+                <canvas id="plan-canvas" width="1340" height="500"
+                    style="width: 100%; border: 1px solid #000; background: #1a1a1a;"></canvas>
+            </div>
+
+            <div class="config-category">
+                <div class="header-container" style="margin-bottom: 0;">
+                    <h2 style="margin: 0; border: none; padding-bottom: 0;">SYSTEM EVENT LOG</h2>
+                    <button class="delete-btn" id="btn-clear-log">CLEAR</button>
+                </div>
+                <div class="tables-container">
+                    <div class="table-wrapper" style="max-height: 250px; overflow-y: auto; border: 1px solid #000;">
+                        <table class="config-table" id="event-log" style="margin-top: 0;">
+                            <thead>
+                                <tr>
+                                    <th style="width: 120px;">TIME</th>
+                                    <th style="width: 80px;">TAG</th>
+                                    <th>MESSAGE</th>
+                                </tr>
+                            </thead>
+                            <tbody id="log-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="column-side">
+            <div class="config-category">
+                <h2>MAV COMMAND CONSOLE</h2>
+                <div class="console-box">
+                    <div id="console-output" class="console-output"></div>
+                    <div class="console-input-row">
+                        <span class="console-prompt">&gt;</span>
+                        <input type="text" id="console-input" class="console-input"
+                            placeholder="Type a command... (help for list)" autocomplete="off" spellcheck="false" />
+                        <button class="edit-btn" id="console-send">SEND</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="config-category">
+                <h2 style="display: flex; justify-content: space-between;">
+                    MAVROS ODOMETRY
+                    <span id="gps-fix-badge" class="error" style="font-size: 14px;">NO FIX</span>
+                </h2>
+                <div class="tables-container">
+                    <div class="table-wrapper">
+                        <table class="config-table">
+                            <tr>
+                                <th>LATITUDE</th>
+                                <td id="mav-lat">–.–––––°</td>
+                            </tr>
+                            <tr>
+                                <th>LONGITUDE</th>
+                                <td id="mav-lon">–.–––––°</td>
+                            </tr>
+                            <tr>
+                                <th>ALTITUDE (MSL)</th>
+                                <td id="mav-alt-msl">–.–– m</td>
+                            </tr>
+                            <tr>
+                                <th>REL. ALTITUDE</th>
+                                <td id="mav-alt-rel">–.–– m</td>
+                            </tr>
+                            <tr>
+                                <th>HEADING</th>
+                                <td id="mav-heading">–––°</td>
+                            </tr>
+                            <tr>
+                                <th>GROUND SPEED</th>
+                                <td id="mav-spd">–.– m/s</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="config-category">
+                <h2>VIO LOCAL ODOMETRY</h2>
+                <div class="tables-container">
+                    <div class="table-wrapper">
+                        <table class="config-table">
+                            <tr>
+                                <th>POS X</th>
+                                <td id="pos-x">0.000 m</td>
+                            </tr>
+                            <tr>
+                                <th>POS Y</th>
+                                <td id="pos-y">0.000 m</td>
+                            </tr>
+                            <tr>
+                                <th>POS Z</th>
+                                <td id="pos-z">0.000 m</td>
+                            </tr>
+                            <tr>
+                                <th>ROLL</th>
+                                <td id="ori-r">0.0°</td>
+                            </tr>
+                            <tr>
+                                <th>PITCH</th>
+                                <td id="ori-p">0.0°</td>
+                            </tr>
+                            <tr>
+                                <th>YAW</th>
+                                <td id="ori-y">0.0°</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="config-category">
+                <h2>IMU SENSORS</h2>
+                <div class="tables-container">
+                    <div class="table-wrapper">
+                        <table class="config-table">
+                            <tr>
+                                <th>ANG VEL X</th>
+                                <td id="imu-avx">0.000</td>
+                            </tr>
+                            <tr>
+                                <th>ANG VEL Y</th>
+                                <td id="imu-avy">0.000</td>
+                            </tr>
+                            <tr>
+                                <th>ANG VEL Z</th>
+                                <td id="imu-avz">0.000</td>
+                            </tr>
+                            <tr>
+                                <th>LIN ACC X</th>
+                                <td id="imu-lax">0.000</td>
+                            </tr>
+                            <tr>
+                                <th>LIN ACC Y</th>
+                                <td id="imu-lay">0.000</td>
+                            </tr>
+                            <tr>
+                                <th>LIN ACC Z</th>
+                                <td id="imu-laz">0.000</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

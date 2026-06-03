@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HEXSOON 450 — System</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body style="padding: 20px; max-width: 1400px; margin: 0 auto;">
+
+    <div class="header-container">
+        <h1>HEXSOON 450 <span style="font-size: 18px; color: #555;">GPS-DENIED FLIGHT OPERATIONS</span></h1>
+        <div style="margin-left: auto; text-align: right;">
+            <div id="sys-clock" style="font-size: 18px; font-weight: bold;">--:--:--</div>
+            <div id="ros-status-pill" class="error" style="margin-top: 5px;">
+                <span id="ros-status-text">DISCONNECTED</span>
+            </div>
+        </div>
+    </div>
+
+    <nav class="navbar">
+        <a href="index.html" class="nav-link">MISSION CONTROL</a>
+        <a href="flight_tests.html" class="nav-link">FLIGHT TESTS</a>
+        <a href="history.html" class="nav-link">HISTORY</a>
+        <a href="system.html" class="nav-link active">SYSTEM</a>
+        <a href="utils.html" class="nav-link">UTILS</a>
+    </nav>
+
+    <div class="sys-grid">
+
+        <div class="config-category">
+            <div class="header-container" style="margin-bottom: 10px;">
+                <h2 style="margin: 0; border: none; padding-bottom: 0;">SYSTEM INFO</h2>
+                <span id="last-update" style="font-size: 12px; color: #555;">Never updated</span>
+            </div>
+            <table class="config-table">
+                <tr>
+                    <th>HOSTNAME</th>
+                    <td id="s-hostname">—</td>
+                </tr>
+                <tr>
+                    <th>KERNEL</th>
+                    <td id="s-kernel">—</td>
+                </tr>
+                <tr>
+                    <th>ARCH</th>
+                    <td id="s-arch">—</td>
+                </tr>
+                <tr>
+                    <th>UPTIME</th>
+                    <td id="s-uptime">—</td>
+                </tr>
+                <tr>
+                    <th>LOAD AVG</th>
+                    <td id="s-load">—</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="config-category">
+            <h2>CPU</h2>
+            <table class="config-table">
+                <tr>
+                    <th>CORES</th>
+                    <td id="s-cpu-cores">—</td>
+                </tr>
+                <tr>
+                    <th>USAGE</th>
+                    <td id="s-cpu-pct">—</td>
+                </tr>
+            </table>
+            <div class="sys-bar-wrap">
+                <div id="bar-cpu" class="sys-bar"></div>
+            </div>
+        </div>
+
+        <div class="config-category">
+            <h2>MEMORY</h2>
+            <table class="config-table">
+                <tr>
+                    <th>TOTAL</th>
+                    <td id="s-ram-total">—</td>
+                </tr>
+                <tr>
+                    <th>USED</th>
+                    <td id="s-ram-used">—</td>
+                </tr>
+                <tr>
+                    <th>USAGE</th>
+                    <td id="s-ram-pct">—</td>
+                </tr>
+            </table>
+            <div class="sys-bar-wrap">
+                <div id="bar-ram" class="sys-bar"></div>
+            </div>
+        </div>
+
+        <div class="config-category">
+            <h2>DISK ( / )</h2>
+            <table class="config-table">
+                <tr>
+                    <th>TOTAL</th>
+                    <td id="s-disk-total">—</td>
+                </tr>
+                <tr>
+                    <th>USED</th>
+                    <td id="s-disk-used">—</td>
+                </tr>
+                <tr>
+                    <th>USAGE</th>
+                    <td id="s-disk-pct">—</td>
+                </tr>
+            </table>
+            <div class="sys-bar-wrap">
+                <div id="bar-disk" class="sys-bar"></div>
+            </div>
+        </div>
+
+        <div class="config-category">
+            <h2>NETWORK</h2>
+            <table class="config-table">
+                <tr>
+                    <th>GATEWAY</th>
+                    <td id="s-gateway">—</td>
+                </tr>
+                <tr>
+                    <th>GATEWAY PING</th>
+                    <td id="s-internet">—</td>
+                </tr>
+            </table>
+            <table class="config-table" id="iface-table" style="margin-top: 10px;">
+                <thead>
+                    <tr>
+                        <th>INTERFACE</th>
+                        <th>FAMILY</th>
+                        <th>ADDRESS</th>
+                    </tr>
+                </thead>
+                <tbody id="iface-body"></tbody>
+            </table>
+        </div>
+
+        <div class="config-category">
+            <div class="header-container" style="margin-bottom: 10px;">
+                <h2 style="margin: 0; border: none; padding-bottom: 0;">ROS 2 NODES</h2>
+                <span id="s-node-count" style="font-size: 13px; font-weight: bold; color: #555;">0 nodes</span>
+            </div>
+            <div id="ros-nodes-list" style="font-size: 13px; line-height: 1.8;">—</div>
+        </div>
+
+        <div class="config-category">
+            <h2>ROS 2 TOPICS</h2>
+            <table class="config-table">
+                <tr>
+                    <th>ACTIVE TOPICS</th>
+                    <td id="s-topic-count">—</td>
+                </tr>
+            </table>
+        </div>
+
+    </div>
+
+    <script src="system.js"></script>
+</body>
+
+</html>
