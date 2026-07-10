@@ -17,19 +17,19 @@ Bring-up happens in two phases. **Do not start the software phase until all thre
 1. **Raspberry Pi Zero 2W power wiring**
    Re-solder the Raspberry Pi Zero 2W so that **ground and power share the telemetry-in port**.
 
-   ![Raspberry Pi power wiring](Drones-and-Orbs/images/raspi_image.jpg)
+   ![Raspberry Pi power wiring](images/raspi_image.jpg)
 
 2. **ARK-Flow mount**
    Print the ARK-Flow bracket and attach the sensor to the **bottom of the battery holder**. Make sure that 
    the arkflow's **Y direction** points in the same direction as the **flight controllers X direction** (marked on top of the 
    GPS module)
 
-   ![ARK-Flow mounted to battery holder](Drones-and-Orbs/images/arkflow_image.jpg)
+   ![ARK-Flow mounted to battery holder](images/arkflow_image.jpg)
 
 3. **Bearing lock**
    Lock the bearings in place: seat them with a **1/16" drill bit**, then drill an **M3 screw** through the bearing and **only slightly into the shaft** (do not bottom out into the shaft).
 
-   ![Bearing locked on shaft](Drones-and-Orbs/images/bearing_image.jpg)
+   ![Bearing locked on shaft](images/bearing_image.jpg)
 
 ### ✅ Hardware confirmation gate
 
