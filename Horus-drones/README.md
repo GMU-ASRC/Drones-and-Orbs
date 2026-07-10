@@ -28,6 +28,7 @@ Bring-up happens in two phases. **Do not start the software phase until all thre
 
 3. **Bearing lock**
    Lock the bearings in place: seat them with a **1/16" drill bit**, then drill an **M3 screw** through the bearing and **only slightly into the shaft** (do not bottom out into the shaft).
+   An important note, when you lock the bearings with a screw make sure the drone is level with the ground. There are two hexagons on the cage opposite eachother that allow the drone to sit horizontally flat with the ground.
 
    ![Bearing locked on shaft](images/bearing_image.jpg)
 
