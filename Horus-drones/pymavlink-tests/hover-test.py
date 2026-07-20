@@ -54,6 +54,9 @@ def main():
         print("no RT priority — run with sudo for SCHED_FIFO")
 
     m = mavutil.mavlink_connection(CONN_STR)
+    m.mav.heartbeat_send(
+    mavutil.mavlink.MAV_TYPE_GCS,
+    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
     print("waiting for heartbeat...")
     m.wait_heartbeat()
     print(f"heartbeat: sys {m.target_system} comp {m.target_component}")
