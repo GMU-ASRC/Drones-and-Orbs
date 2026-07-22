@@ -106,7 +106,10 @@ class DroneController:
 
         self.home = None                     # (x0, y0, z0, yaw0) at connect
         self._lp_stamp = 0.0
-        self._rot_rate = 0.0                 # rad/s for position-anchored rotation
+        sself._rot_step = 0.0                 # rad per step (step-and-stare)
+        self._rot_next_t = 0.0               # when to take the next step
+        self._rot_dwell = 1.0                # s between steps    
+
     # ========================== lifecycle ==========================
     def connect(self, timeout: float = 10.0):
         """Connect via mavp2p, get heartbeat + initial pose, start streaming
@@ -120,6 +123,13 @@ class DroneController:
         self._m.wait_heartbeat(timeout=timeout)
         print(f"[drone] heartbeat: sys {self._m.target_system} "
               f"comp {self._m.target_component}")
+
+        # request LOCAL_POSITION_NED (32) and ATTITUDE (30) at 20 Hz
+        for msg_id in (32, 30):
+            self._m.mav.command_long_send(
+                self._m.target_system, self._m.target_component,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                msg_id, int(1e6 / 20), 0, 0, 0, 0, 0)
 
         lp = self._m.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=5)
         att = self._m.recv_match(type='ATTITUDE', blocking=True, timeout=5)
@@ -184,18 +194,22 @@ class DroneController:
         self.land()
         return False
 
-    def rotate(self, yaw_rate_dps: float):
-        """Position-anchored spin: hold x/y/z, step the yaw setpoint.
-        Safe to call every loop tick -- anchors position only on entry."""
-        yr = math.radians(_clamp(yaw_rate_dps, YAWRATE_MAX))
+    def rotate(self, yaw_rate_dps: float = None,
+               step_deg: float = 20.0, dwell_s: float = 1.0):
+        """Step-and-stare search: yaw snaps step_deg, then holds a static
+        position+yaw setpoint for dwell_s, repeats. x/y/z anchor is fixed at
+        entry and never re-anchored, so drift can't accumulate.
+        (yaw_rate_dps kept for call-compatibility; ignored.)"""
         with self._lock:
-            if self._sp_mode != 'rot':       # entering rotation: anchor here
+            if self._sp_mode != 'rot':       # entering: anchor once
                 lp, att = self._lp, self._att
                 if lp is None or att is None:
                     return
                 self._sp_pos = (lp.x, lp.y, self._z_hold, att.yaw)
+                self._rot_next_t = time.monotonic() + dwell_s
                 self._sp_mode = 'rot'
-            self._rot_rate = yr
+            self._rot_step = math.radians(step_deg)
+            self._rot_dwell = dwell_s
 
     def move_body(self, vx: float, vy: float = 0.0, yaw_rate_dps: float = 0.0):
         """Body-frame velocity: vx forward (m/s), vy right, yaw_rate deg/s.
@@ -271,10 +285,11 @@ class DroneController:
             with self._lock:
                 if mode in ('pos', 'rot'):
                     x, y, z, yaw = self._sp_pos
-                    if mode == 'rot':
-                        yaw += self._rot_rate * _DT
+                    if mode == 'rot' and now >= self._rot_next_t:
+                        yaw += self._rot_step
                         yaw = (yaw + math.pi) % (2 * math.pi) - math.pi  # wrap
                         self._sp_pos = (x, y, z, yaw)
+                        self._rot_next_t = now + self._rot_dwell                    
                     self._m.mav.set_position_target_local_ned_send(
                         0, self._m.target_system, self._m.target_component,
                         mavutil.mavlink.MAV_FRAME_LOCAL_NED,
