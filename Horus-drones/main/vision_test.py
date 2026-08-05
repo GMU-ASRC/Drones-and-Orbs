@@ -204,8 +204,11 @@ def print_cluster_report(cr, log):
         print(f"  corners per drone    : {dist}")
     if "span_med" in cr:
         print(f"  cage span (px)       : {cr['span_min']} .. "
-              f"{cr['span_med']} .. {cr['span_max']}   <- range proxy, use "
-              f"this to set SPAN_CLUMP")
+              f"{cr['span_med']} .. {cr['span_max']}")
+        print("      span is the apparent cage width and the better range "
+              "proxy than area.\n      Note the value at your intended clump "
+              "standoff -- R_CLUMP in\n      clump_declump.py still measures "
+              "blob area and needs recalibrating.")
     log.add_meta("clustering", cr)
 
     if cr["avg_found"] < 1.0:
