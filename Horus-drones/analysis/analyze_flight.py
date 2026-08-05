@@ -9,18 +9,23 @@ main/clump_declump.py or main/vision_test.py:
 
 What it does
 ------------
-1. Re-runs the EXACT detection pipeline from camera_controller over the
-   recorded video, frame by frame.
+1. Re-runs the EXACT detection pipeline over the recorded video, frame by
+   frame -- including the corner clustering, imported from corner_cluster.py
+   rather than reimplemented, so the analysis cannot drift from what flew.
 2. For every frame where the target was not detected, works out WHY, by
    inspecting the region where the target was last seen:
 
+     CORNERS_UNCLUSTERED   corners were found but did not group into a drone.
+                     Carries the closest-pair separation in corner-radii, so it
+                     tells you what to raise LINK_K to.
+     TOO_FEW_CORNERS corners found, but fewer than MIN_CORNERS.
+     CLUSTER_TOO_SMALL     grouped, but under MIN_CLUSTER_AREA.
+     BELOW_MIN_CORNER_AREA green pixels survived morphology but no blob was
+                     even corner-sized.
      HSV_MISS        nothing passed the colour threshold. The ROI report then
                      says which channel failed -- S too low (washed out), V too
                      low (too dark), or hue outside the window.
-     MORPH_ERODED    pixels passed the threshold but open/close removed them
-                     (blob smaller than the OPEN_K kernel, or fragmented).
-     BELOW_MIN_AREA  a blob was found and thrown away for being under MIN_AREA.
-     FRAGMENTED      several sub-threshold blobs that together clear MIN_AREA.
+     MORPH_ERODED    pixels passed the threshold but open/close removed them.
      LEFT_FRAME      the target was at the frame edge on the last good frame.
                      With HFOV 24.3 deg this is what a yaw step looks like.
      NO_TARGET       genuinely nothing green anywhere.
@@ -42,6 +47,7 @@ Try new thresholds against the recording without re-flying:
 import argparse
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -49,6 +55,15 @@ import sys
 
 import cv2
 import numpy as np
+
+# The detector's corner grouping, imported rather than reimplemented so the
+# analysis always describes the code that actually flew. corner_cluster.py is
+# stdlib-only for exactly this reason -- importing it does not drag in picamera2.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "main"))
+from corner_cluster import (ClusterParams, cluster_corners,      # noqa: E402
+                            extract_corners, nearest_ratio,
+                            summarize_cluster)
 
 # frames whose gap from the previous detection exceeds this are "dropouts"
 DROPOUT_S = 0.5
@@ -173,41 +188,65 @@ def build_alignment(pts_ms, vision):
 # ========================== detection ==========================
 class Detector:
     """Mirror of camera_controller's pipeline, plus the diagnostics that were
-    too expensive to compute in flight."""
+    too expensive to compute in flight.
+
+    The target is a CLUSTER of green cage corners, not the largest blob -- see
+    corner_cluster.py. `prev` carries the previous frame's target so the
+    continuity gate behaves as it did in flight.
+    """
 
     def __init__(self, cfg):
         self.lower = np.array(cfg["hsv_lower"], dtype=np.uint8)
         self.upper = np.array(cfg["hsv_upper"], dtype=np.uint8)
         self.min_area = cfg["min_area"]
+        self.p = ClusterParams.from_cfg(cfg)
+        self.gate_k = float(cfg.get("track_gate_k", 4.0))
         self.open_k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (cfg["open_k"], cfg["open_k"]))
         self.close_k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (cfg["close_k"], cfg["close_k"]))
+        self.prev = None                    # (cx, cy, span)
 
     def run(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         raw = cv2.inRange(hsv, self.lower, self.upper)
         mask = cv2.morphologyEx(raw, cv2.MORPH_OPEN, self.open_k)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.close_k)
-        num, lbl, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
+        num, _, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
 
-        best, bbox, centroid, areas = 0, None, None, []
-        if num > 1:
-            areas = sorted(stats[1:, cv2.CC_STAT_AREA].tolist(), reverse=True)
-            i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-            best = int(stats[i, cv2.CC_STAT_AREA])
-            bbox = (int(stats[i, cv2.CC_STAT_LEFT]),
-                    int(stats[i, cv2.CC_STAT_TOP]),
-                    int(stats[i, cv2.CC_STAT_WIDTH]),
-                    int(stats[i, cv2.CC_STAT_HEIGHT]))
-            centroid = (float(cent[i][0]), float(cent[i][1]))
+        corners = extract_corners(stats, cent, self.p)
+        clusters = cluster_corners(corners, self.p)
+        best = max((c[2] for c in corners), default=0)
+
+        chosen = None
+        if clusters:
+            summaries = [summarize_cluster(g) for g in clusters]
+            if self.prev is not None:
+                px, py, pspan = self.prev
+                gate = self.gate_k * max(pspan, 20.0)
+                near = [(math.hypot(g["cx"] - px, g["cy"] - py), g)
+                        for g in summaries]
+                near = [t for t in near if t[0] <= gate]
+                if near:
+                    near.sort(key=lambda t: t[0])
+                    chosen = near[0][1]
+            if chosen is None:
+                chosen = max(summaries, key=lambda g: (g["n"], g["area"]))
+            self.prev = (chosen["cx"], chosen["cy"], chosen["span"])
+
         return {
             "hsv": hsv, "raw": raw, "mask": mask,
             "raw_px": int(cv2.countNonZero(raw)),
             "mask_px": int(cv2.countNonZero(mask)),
-            "n_comp": int(num - 1), "best": best, "areas": areas,
-            "bbox": bbox, "centroid": centroid,
-            "accepted": best >= self.min_area,
+            "n_comp": int(num - 1), "best": int(best),
+            "areas": sorted((c[2] for c in corners), reverse=True),
+            "corners": corners, "n_found": len(corners),
+            "n_clusters": len(clusters),
+            "min_sep_ratio": nearest_ratio(corners),
+            "cluster": chosen,
+            "bbox": chosen["bbox"] if chosen else None,
+            "centroid": (chosen["cx"], chosen["cy"]) if chosen else None,
+            "accepted": chosen is not None,
         }
 
 
@@ -255,17 +294,35 @@ def diagnose(res, det_cfg, last_bbox, shape):
     if res["accepted"]:
         return "OK", ""
     lower, upper = det_cfg.lower, det_cfg.upper
-    min_area = det_cfg.min_area
+    p = det_cfg.p
 
-    # a blob existed and was thrown away purely on size
-    if res["best"] > 0 and res["best"] < min_area:
-        near = sum(a for a in res["areas"] if a >= min_area * 0.2)
-        if len(res["areas"]) > 1 and near >= min_area:
-            return "FRAGMENTED", (f"{len(res['areas'])} blobs, largest "
-                                  f"{res['best']}px, combined {near}px "
-                                  f">= MIN_AREA {min_area}")
-        return "BELOW_MIN_AREA", (f"largest blob {res['best']}px < MIN_AREA "
-                                  f"{min_area}")
+    # Corners were visible but no drone came out of them. Which of the two
+    # cluster gates rejected them is the whole diagnosis.
+    if res["n_found"] > 0:
+        if res["n_found"] < p.min_corners:
+            return "TOO_FEW_CORNERS", (
+                f"only {res['n_found']} corner(s) above MIN_CORNER_AREA "
+                f"({p.min_corner_area}px); need {p.min_corners}")
+        r = res["min_sep_ratio"]
+        if r is not None and r > p.link_k:
+            return "CORNERS_UNCLUSTERED", (
+                f"{res['n_found']} corners, closest pair {r:.1f} corner-radii "
+                f"apart but LINK_K={p.link_k} -- raise LINK_K to ~{r * 1.15:.0f}")
+        total = sum(res["areas"])
+        if total < p.min_cluster_area:
+            return "CLUSTER_TOO_SMALL", (
+                f"{res['n_found']} corners totalling {total}px < "
+                f"MIN_CLUSTER_AREA {p.min_cluster_area}")
+        return "CLUSTER_REJECTED", (
+            f"{res['n_found']} corners, closest pair "
+            f"{r if r is None else round(r, 1)} radii, but no cluster survived "
+            f"(check SCALE_RATIO_MAX={p.scale_ratio_max})")
+
+    # nothing even reached corner size
+    if res["mask_px"] > 0:
+        return "BELOW_MIN_CORNER_AREA", (
+            f"{res['mask_px']}px of mask but largest blob {res['best']}px < "
+            f"MIN_CORNER_AREA {p.min_corner_area}")
 
     if res["raw_px"] > 0 and res["mask_px"] == 0:
         return "MORPH_ERODED", (f"{res['raw_px']}px passed HSV but open/close "
@@ -749,12 +806,19 @@ def analyze_session(session, hsv=None, min_area=None, write_video=True,
             t0 = t
         reason, detail = diagnose(res, det, last_bbox, frame.shape)
 
-        radius = (res["best"] / np.pi) ** 0.5 if res["accepted"] else None
+        g = res["cluster"]
         samples.append({
             "i": i, "t": t, "t_rel": t - t0,
             "accepted": res["accepted"], "best": res["best"],
             "raw_px": res["raw_px"], "mask_px": res["mask_px"],
-            "n_comp": res["n_comp"], "radius": radius,
+            "n_comp": res["n_comp"],
+            "radius": (g["area"] / np.pi) ** 0.5 if g else None,
+            "span": g["span"] if g else None,
+            "n_corners": g["n"] if g else 0,
+            "n_found": res["n_found"], "n_clusters": res["n_clusters"],
+            "min_sep_ratio": res["min_sep_ratio"],
+            "sep_ratio": (g["span"] / g["r_med"]
+                          if g and g["r_med"] > 0 else None),
             "reason": reason, "detail": detail,
             "state": row.get("state"), "exp_us": row.get("exp_us"),
             "gain": row.get("gain"), "bbox": res["bbox"],
@@ -878,13 +942,32 @@ def annotate(frame, res, s, cfg):
     tint[:, :, 1] = res["mask"]
     vis = cv2.addWeighted(vis, 1.0, tint, 0.35, 0)
 
+    # every corner considered: cyan if it made the chosen cluster, grey if not.
+    # Seeing which corners were dropped is the fastest way to spot a LINK_K or
+    # SCALE_RATIO_MAX that is too tight.
+    chosen = res.get("cluster")
+    in_cluster = {(round(c[0], 1), round(c[1], 1))
+                  for c in (chosen["corners"] if chosen else [])}
+    for c in res.get("corners", []):
+        key = (round(c[0], 1), round(c[1], 1))
+        col = (255, 255, 0) if key in in_cluster else (140, 140, 140)
+        cv2.circle(vis, (int(c[0]), int(c[1])), max(3, int(c[3])), col, 1)
+
+    # the links that made it one drone
+    if chosen and len(chosen["corners"]) > 1:
+        pts = chosen["corners"]
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                cv2.line(vis, (int(pts[i][0]), int(pts[i][1])),
+                         (int(pts[j][0]), int(pts[j][1])), (255, 255, 0), 1)
+
     if res["bbox"]:
         x, y, w, h = res["bbox"]
         col = (0, 255, 0) if res["accepted"] else (0, 140, 255)
         cv2.rectangle(vis, (x, y), (x + w, y + h), col, 2)
     if res["centroid"] and res["accepted"]:
         cv2.circle(vis, (int(res["centroid"][0]), int(res["centroid"][1])),
-                   4, (0, 0, 255), -1)
+                   5, (0, 0, 255), -1)
 
     fh, fw = vis.shape[:2]
     cv2.line(vis, (fw // 2, fh // 2 - 10), (fw // 2, fh // 2 + 10),
@@ -894,11 +977,12 @@ def annotate(frame, res, s, cfg):
 
     lines = [
         f"f{s['i']} t={s['t_rel']:.1f}s {s['state'] or ''}",
-        f"raw={s['raw_px']} mask={s['mask_px']} n={s['n_comp']} "
-        f"best={s['best']}/{cfg['min_area']}",
+        f"corners={s['n_found']} clusters={s['n_clusters']} "
+        f"mask={s['mask_px']} best={s['best']}",
     ]
     if s["accepted"]:
-        lines.append(f"r={s['radius']:.0f}px")
+        lines.append(f"DRONE: {s['n_corners']} corners  "
+                     f"span={s['span']:.0f}px  r={s['radius']:.0f}px")
     else:
         lines.append(s["reason"])
         if s["detail"]:

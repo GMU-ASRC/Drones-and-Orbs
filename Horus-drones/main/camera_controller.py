@@ -70,6 +70,9 @@ import cv2
 import numpy as np
 from picamera2 import Picamera2
 
+from corner_cluster import (ClusterParams, cluster_corners,
+                            extract_corners, nearest_ratio,
+                            summarize_cluster)
 from flight_logger import NullLogger
 
 # --------------------------- TUNABLES ---------------------------
@@ -85,7 +88,39 @@ HSV_LOWER  = np.array([35, 60, 40])
 HSV_UPPER  = np.array([85, 255, 255])
 OPEN_K     = 3
 CLOSE_K    = 21
-MIN_AREA   = 150
+MIN_AREA   = 150          # legacy single-blob threshold, kept for reference
+
+# -- cage / corner clustering --------------------------------------
+# The target is not one green blob: it is the several green corners of a drone
+# cage. Taking the largest blob made the tracker hop between corners as their
+# apparent sizes swapped, which is what looked like "loses sight of it".
+# Instead: find every corner, group the ones clustered together, and call that
+# group the drone.
+#
+# The link test is scale-invariant on purpose. Two corners separated by X
+# metres, seen at range R, are X*f/R px apart, and each corner of size c is
+# c*f/R px across -- so the RATIO separation/corner-radius is X/c whatever the
+# range. Linking on that ratio therefore works at every distance without
+# knowing X, c or R. (It also survives cage rotation, which shrinks the
+# projected separation but never grows it past the face-on value.)
+MIN_CORNER_AREA  = 20     # px: smallest blob accepted as a corner
+LINK_K           = 18.0   # link two corners if gap <= LINK_K * mean corner radius
+                          #   PROVISIONAL -- depends on your cage's corner
+                          #   spacing over corner size, which has not been
+                          #   measured yet. vision_test.py prints the value
+                          #   observed in the run and recommends a new one.
+                          #   Too small silently fails to group corners, which
+                          #   looks exactly like the original bug; too large
+                          #   can merge two nearby drones. Erring high.
+SCALE_RATIO_MAX  = 5.0    # never link corners whose radii differ by more than
+                          # this: they are at different ranges, so different drones
+MIN_CORNERS      = 2      # clustered blobs needed before we call it a drone
+MIN_CLUSTER_AREA = 60     # total px across the cluster
+MAX_BLOBS        = 24     # cap on blobs considered (noise guard, keeps O(n^2) small)
+TRACK_GATE_K     = 4.0    # prefer the cluster nearest last frame's target, within
+                          # this many "target widths". Stops the tracker swapping
+                          # between two drones -- or between two readings of one.
+TRACK_HOLD_S     = 1.0    # forget that position after this long with no target
 
 # -- debug recording --
 RECORD_VIDEO    = True        # hardware H.264 of the whole flight
@@ -99,11 +134,21 @@ SNAP_COOLDOWN_S = 1.0         # min gap between event snapshots. Kept short: the
 EDGE_MARGIN_PX  = 40          # "was leaving the frame" test for lose events
 # ----------------------------------------------------------------
 
+# the geometry knobs above, packaged for corner_cluster and recorded into
+# session.json so the analyzer reproduces this exact configuration
+CLUSTER = ClusterParams(
+    min_corner_area=MIN_CORNER_AREA, link_k=LINK_K,
+    scale_ratio_max=SCALE_RATIO_MAX, min_corners=MIN_CORNERS,
+    min_cluster_area=MIN_CLUSTER_AREA, max_blobs=MAX_BLOBS,
+)
+
 VISION_FIELDS = [
     "frame", "t_mono", "sensor_ts_s", "frame_lag_ms", "cv_ms", "fps",
     "detect_on", "state",
     "mask_raw_px", "mask_px", "n_comp", "best_area", "accepted",
-    "cx", "cy", "ang_x", "ang_y", "radius",
+    "cx", "cy", "ang_x", "ang_y", "radius", "span_px", "n_corners",
+    "corner_r_med", "sep_ratio", "n_found", "min_sep_ratio",
+    "n_clusters", "jump_px",
     "bbox_x", "bbox_y", "bbox_w", "bbox_h", "near_edge",
     "exp_us", "gain", "dgain", "lux", "awb_r", "awb_b",
 ]
@@ -111,15 +156,22 @@ VISION_FIELDS = [
 
 @dataclass
 class Detection:
-    """One detection result. Angles in degrees, camera-relative:
-    ang_x > 0 target is RIGHT of center, ang_y > 0 target is BELOW center."""
+    """One detection result: a CLUSTER of green cage corners, not one blob.
+    Angles in degrees, camera-relative: ang_x > 0 target is RIGHT of center,
+    ang_y > 0 target is BELOW center."""
     stamp: float = 0.0          # time.monotonic() of the frame
     ang_x: float = 0.0
     ang_y: float = 0.0
-    area: int = 0
-    radius: float = 0.0         # apparent radius px -- your range proxy
+    area: int = 0               # summed area of every corner in the cluster
+    radius: float = 0.0         # equivalent radius of that summed area
     bearing_x: float = 0.0      # normalized -1..+1 (kept for debugging)
     bearing_y: float = 0.0
+    span_px: float = 0.0        # widest corner-to-corner distance = apparent
+                                # cage size. Preferred range proxy: it comes
+                                # from the cage geometry rather than from how
+                                # much of one corner happens to be lit.
+    n_corners: int = 0          # corners in the cluster
+    corner_r_med: float = 0.0   # median corner radius (for calibration)
 
     def age(self) -> float:
         return time.monotonic() - self.stamp
@@ -153,6 +205,13 @@ class CameraController:
         self._context = "-"             # behavior state, stamped by main loop
         self._n_det = 0                 # frames with an accepted detection
         self._n_seen = 0                # frames processed with detection on
+        self._prev_target = None        # (cx, cy, span) for the continuity gate
+        self._prev_target_t = 0.0       # when it was last updated
+        # running clustering diagnostics -- surfaced by vision_test so the
+        # cage geometry can be calibrated on the drone, without a laptop
+        self._cl = {"frames": 0, "with_corners": 0, "sum_found": 0,
+                    "max_found": 0, "clustered": 0, "per_drone": {},
+                    "unclustered": [], "spans": []}
 
     # ------------------------- lifecycle -------------------------
     def start(self):
@@ -185,6 +244,10 @@ class CameraController:
             "vfov_deg": VFOV_DEG, "hsv_lower": HSV_LOWER.tolist(),
             "hsv_upper": HSV_UPPER.tolist(), "open_k": OPEN_K,
             "close_k": CLOSE_K, "min_area": MIN_AREA,
+            "min_corner_area": MIN_CORNER_AREA, "link_k": LINK_K,
+            "scale_ratio_max": SCALE_RATIO_MAX, "min_corners": MIN_CORNERS,
+            "min_cluster_area": MIN_CLUSTER_AREA,
+            "track_gate_k": TRACK_GATE_K,
             "recording": RECORD_VIDEO, "rec_bitrate": REC_BITRATE,
         })
         if RECORD_VIDEO:
@@ -244,6 +307,7 @@ class CameraController:
 
     def disable_detection(self):
         self._detect_enabled.clear()
+        self._prev_target = None             # don't gate on a pre-pause position
         with self._lock:
             self._latest = None              # don't serve pre-pause detections
         self._log.event("camera", "detection disabled")
@@ -262,6 +326,41 @@ class CameraController:
         """Stamp the behavior state onto subsequent vision.csv rows, so a
         detection gap can be read against what the drone was doing."""
         self._context = state
+
+    def cluster_report(self) -> dict:
+        """Clustering health + a LINK_K recommendation, for printing on the
+        drone at the end of a bench run.
+
+        `suggest_link_k` is driven by the frames where corners WERE visible but
+        did not group: covering the 90th percentile of those separations (plus
+        headroom) is what it would take to hold them together. It is only
+        offered when such frames are a meaningful share of the run, so a couple
+        of stray reflections cannot talk you into a reckless value.
+        """
+        c = self._cl
+        n = max(c["frames"], 1)
+        out = {
+            "frames": c["frames"],
+            "avg_found": round(c["sum_found"] / n, 2),
+            "max_found": c["max_found"],
+            "clustered_pct": round(100.0 * c["clustered"] / n, 1),
+            "per_drone": dict(sorted(c["per_drone"].items())),
+            "unclustered": len(c["unclustered"]),
+            "link_k": CLUSTER.link_k,
+            "min_corners": CLUSTER.min_corners,
+        }
+        if c["spans"]:
+            s = sorted(c["spans"])
+            out["span_min"] = round(s[0], 1)
+            out["span_med"] = round(s[len(s) // 2], 1)
+            out["span_max"] = round(s[-1], 1)
+        if c["unclustered"] and len(c["unclustered"]) > 0.05 * n:
+            u = sorted(c["unclustered"])
+            p90 = u[int(0.9 * (len(u) - 1))]
+            out["unclustered_p90_ratio"] = round(p90, 1)
+            if p90 > CLUSTER.link_k:
+                out["suggest_link_k"] = round(p90 * 1.15, 1)
+        return out
 
     def stats(self) -> tuple[int, int, int]:
         """(frames processed with detection on, frames with an accepted
@@ -313,6 +412,42 @@ class CameraController:
             row["fps"] = round(self._fps, 2)
             if self._csv:
                 self._csv.write(**row)
+
+    def _pick_cluster(self, clusters, row):
+        """Choose which cluster is 'the target'.
+
+        Continuity first: if one cluster is near where the target was last
+        frame, keep it. Otherwise take the strongest (most corners, then
+        largest). Without this the tracker would still swap between two drones
+        in view -- the same failure as swapping between corners, one level up.
+        """
+        if not clusters:
+            return None
+        summaries = [summarize_cluster(g) for g in clusters]
+
+        prev = self._prev_target
+        # a stale position must not keep gating: after a real loss the target
+        # can reappear anywhere, so fall back to "strongest cluster"
+        if prev is not None and time.monotonic() - self._prev_target_t > TRACK_HOLD_S:
+            prev = self._prev_target = None
+        if prev is not None:
+            px, py, pspan = prev
+            gate = TRACK_GATE_K * max(pspan, 20.0)
+            near = []
+            for g in summaries:
+                d = ((g["cx"] - px) ** 2 + (g["cy"] - py) ** 2) ** 0.5
+                if d <= gate:
+                    near.append((d, g))
+            if near:
+                near.sort(key=lambda t: t[0])
+                row["jump_px"] = round(near[0][0], 1)
+                return near[0][1]["corners"]
+
+        best = max(summaries, key=lambda g: (g["n"], g["area"]))
+        if prev is not None:
+            row["jump_px"] = round(((best["cx"] - prev[0]) ** 2 +
+                                    (best["cy"] - prev[1]) ** 2) ** 0.5, 1)
+        return best["corners"]
 
     def _grab(self):
         """One request gives us the frame AND its metadata atomically, so the
@@ -367,49 +502,77 @@ class CameraController:
         num, _, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
         row["n_comp"] = int(num - 1)
 
-        det = None
-        idx = None
-        if num > 1:
-            areas = stats[1:, cv2.CC_STAT_AREA]
-            idx = 1 + int(np.argmax(areas))
-            best = int(stats[idx, cv2.CC_STAT_AREA])
-            row["best_area"] = best            # logged even when rejected
-            if best >= MIN_AREA:
-                cx, cy = cent[idx]
-                bx = (cx - cxi) / cxi
-                by = (cy - cyi) / cyi
-                det = Detection(
-                    stamp=t_now,
-                    ang_x=math.degrees(math.atan(bx * self._tan_half_h)),
-                    ang_y=math.degrees(math.atan(by * self._tan_half_v)),
-                    area=best,
-                    radius=(best / math.pi) ** 0.5,
-                    bearing_x=bx, bearing_y=by,
-                )
-                with self._lock:
-                    self._latest = det
+        corners = extract_corners(stats, cent, CLUSTER)
+        row["best_area"] = int(max((c[2] for c in corners), default=0))
+        row["n_found"] = len(corners)
+        # closest pair, in corner-radii. If corners are visible but not
+        # grouping, this sits just above LINK_K and tells you what to raise it
+        # to -- the whole calibration in one number.
+        mr = nearest_ratio(corners)
+        row["min_sep_ratio"] = round(mr, 1) if mr is not None else ""
 
-                x = int(stats[idx, cv2.CC_STAT_LEFT])
-                y = int(stats[idx, cv2.CC_STAT_TOP])
-                bw = int(stats[idx, cv2.CC_STAT_WIDTH])
-                bh = int(stats[idx, cv2.CC_STAT_HEIGHT])
-                self._last_bbox = (x, y, bw, bh)
-                w, h = PROC_RES
-                row.update({
-                    "accepted": 1, "cx": round(float(cx), 1),
-                    "cy": round(float(cy), 1),
-                    "ang_x": round(det.ang_x, 2), "ang_y": round(det.ang_y, 2),
-                    "radius": round(det.radius, 1),
-                    "bbox_x": x, "bbox_y": y, "bbox_w": bw, "bbox_h": bh,
-                    # near_edge on the last-seen frame is the signature of the
-                    # target being yawed out of a 24 deg FOV rather than lost
-                    "near_edge": int(x < EDGE_MARGIN_PX or
-                                     y < EDGE_MARGIN_PX or
-                                     x + bw > w - EDGE_MARGIN_PX or
-                                     y + bh > h - EDGE_MARGIN_PX),
-                })
-        else:
-            row["best_area"] = 0
+        det = None
+        clusters = cluster_corners(corners, CLUSTER)
+        row["n_clusters"] = len(clusters)
+        best_cluster = self._pick_cluster(clusters, row)
+
+        c = self._cl
+        c["frames"] += 1
+        c["sum_found"] += len(corners)
+        c["max_found"] = max(c["max_found"], len(corners))
+        if corners:
+            c["with_corners"] += 1
+        if clusters:
+            c["clustered"] += 1
+        elif len(corners) >= CLUSTER.min_corners and mr is not None:
+            # corners were visible but refused to group: the separation that
+            # failed is exactly what LINK_K needs to cover
+            if len(c["unclustered"]) < 5000:
+                c["unclustered"].append(mr)
+
+        if best_cluster is not None:
+            g = summarize_cluster(best_cluster)
+            bx = (g["cx"] - cxi) / cxi
+            by = (g["cy"] - cyi) / cyi
+            det = Detection(
+                stamp=t_now,
+                ang_x=math.degrees(math.atan(bx * self._tan_half_h)),
+                ang_y=math.degrees(math.atan(by * self._tan_half_v)),
+                area=g["area"],
+                radius=(g["area"] / math.pi) ** 0.5,
+                bearing_x=bx, bearing_y=by,
+                span_px=g["span"], n_corners=g["n"],
+                corner_r_med=g["r_med"],
+            )
+            with self._lock:
+                self._latest = det
+            self._prev_target = (g["cx"], g["cy"], g["span"])
+            self._prev_target_t = t_now
+            c["per_drone"][g["n"]] = c["per_drone"].get(g["n"], 0) + 1
+            if len(c["spans"]) < 5000:
+                c["spans"].append(g["span"])
+
+            x, y, bw, bh = g["bbox"]
+            self._last_bbox = (x, y, bw, bh)
+            w, h = PROC_RES
+            row.update({
+                "accepted": 1, "cx": round(g["cx"], 1), "cy": round(g["cy"], 1),
+                "ang_x": round(det.ang_x, 2), "ang_y": round(det.ang_y, 2),
+                "radius": round(det.radius, 1),
+                "span_px": round(g["span"], 1), "n_corners": g["n"],
+                "corner_r_med": round(g["r_med"], 2),
+                # separation/corner-radius: the range-invariant shape number.
+                # Feed it back into LINK_K once you have real footage.
+                "sep_ratio": (round(g["span"] / g["r_med"], 1)
+                              if g["r_med"] > 0 else ""),
+                "bbox_x": x, "bbox_y": y, "bbox_w": bw, "bbox_h": bh,
+                # near_edge on the last-seen frame is the signature of the
+                # target being yawed out of a 24 deg FOV rather than lost
+                "near_edge": int(x < EDGE_MARGIN_PX or
+                                 y < EDGE_MARGIN_PX or
+                                 x + bw > w - EDGE_MARGIN_PX or
+                                 y + bh > h - EDGE_MARGIN_PX),
+            })
 
         self._n_seen += 1
         if det is not None:

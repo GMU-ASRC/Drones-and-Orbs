@@ -28,7 +28,7 @@ tracking is rock solid at the same ranges, the problem is motion-related and
 the flight logs are where to look.
 
 Live console output tells you what it is doing while you walk:
-  DETECT lines carry the bearing, apparent radius and mask health.
+  DRONE lines carry the corner count, bearing and apparent cage span.
   A "no target" heartbeat carries mask_raw_px, which is the tell for HSV/
   exposure problems: a nonzero raw count with no accepted blob means the
   target IS passing the colour threshold but is being rejected on size.
@@ -81,6 +81,7 @@ def main():
     t_last_print = 0.0
     t_last_hb = 0.0
     r_min, r_max = None, None
+    s_min, s_max = None, None
     gaps = []                    # (start_t, duration) of every dropout
     gap_start = None
     t0 = time.monotonic()
@@ -112,12 +113,15 @@ def main():
             if fresh and not args.quiet:
                 r_min = det.radius if r_min is None else min(r_min, det.radius)
                 r_max = det.radius if r_max is None else max(r_max, det.radius)
+                s_min = det.span_px if s_min is None else min(s_min, det.span_px)
+                s_max = det.span_px if s_max is None else max(s_max, det.span_px)
                 if now - t_last_print >= PRINT_EVERY_S:
                     t_last_print = now
                     seen, hit, _ = cam.stats()
-                    print(f"[t={elapsed:6.1f}s] DETECT  "
+                    print(f"[t={elapsed:6.1f}s] DRONE  "
+                          f"{det.n_corners} corners  "
                           f"ang=({det.ang_x:+5.1f},{det.ang_y:+5.1f})deg  "
-                          f"area={det.area:6d}  r={det.radius:5.1f}px  "
+                          f"span={det.span_px:5.1f}px  area={det.area:6d}  "
                           f"fps={cam.fps():4.1f}  "
                           f"hit={100.0 * hit / max(seen, 1):3.0f}%", flush=True)
             elif not fresh and not args.quiet and now - t_last_hb >= HEARTBEAT_S:
@@ -155,6 +159,8 @@ def main():
             "longest_dropout_s": max([g[1] for g in gaps], default=0.0),
             "radius_min_px": round(r_min, 1) if r_min else None,
             "radius_max_px": round(r_max, 1) if r_max else None,
+            "span_min_px": round(s_min, 1) if s_min else None,
+            "span_max_px": round(s_max, 1) if s_max else None,
         }
         log.add_meta("summary", summary)
 
@@ -169,9 +175,8 @@ def main():
             print("  dropouts (t, len)    : " +
                   ", ".join(f"{t:.0f}s/{d:.1f}s" for t, d in shown) +
                   (" ..." if len(long_gaps) > len(shown) else ""))
-        if r_min is not None:
-            print(f"  radius range         : {r_min:.0f}-{r_max:.0f} px "
-                  f"(R_CLUMP=60, R_DECLUMP=25)")
+        print_cluster_report(cam.cluster_report(), log)
+
         print(f"\n  logs: {log.dir}")
         log.close()
 
@@ -180,6 +185,48 @@ def main():
         else:
             print(f"  analyse: python3 ../analysis/analyze_flight.py "
                   f"{log.dir}\n")
+
+
+def print_cluster_report(cr, log):
+    """Corner-clustering health, printed on the drone.
+
+    This is the calibration readout: it tells you whether the cage's corners
+    are being found at all, whether they are being grouped into one drone, and
+    if not, what LINK_K would have to be.
+    """
+    print("\n--- corner clustering ---")
+    print(f"  corners found/frame  : avg {cr['avg_found']}, max "
+          f"{cr['max_found']}")
+    print(f"  frames clustered     : {cr['clustered_pct']}%  "
+          f"(need >= {cr['min_corners']} corners to call it a drone)")
+    if cr["per_drone"]:
+        dist = "  ".join(f"{k}:{v}" for k, v in cr["per_drone"].items())
+        print(f"  corners per drone    : {dist}")
+    if "span_med" in cr:
+        print(f"  cage span (px)       : {cr['span_min']} .. "
+              f"{cr['span_med']} .. {cr['span_max']}   <- range proxy, use "
+              f"this to set SPAN_CLUMP")
+    log.add_meta("clustering", cr)
+
+    if cr["avg_found"] < 1.0:
+        print("\n  !! almost no green corners found. This is a colour/exposure "
+              "problem,\n     not a clustering one -- check the annotated "
+              "video and HSV first.")
+    elif "suggest_link_k" in cr:
+        print(f"\n  !! {cr['unclustered']} frames had corners that did NOT "
+              f"group.")
+        print(f"     Their closest pairs sat {cr['unclustered_p90_ratio']} "
+              f"corner-radii apart,\n     but LINK_K is {cr['link_k']}. To "
+              f"hold them together set, in camera_controller.py:")
+        print(f"\n         LINK_K = {cr['suggest_link_k']}\n")
+        print("     Then re-run this test and check 'frames clustered' rises.")
+    elif cr["clustered_pct"] < 80:
+        print(f"\n  note: {100 - cr['clustered_pct']:.0f}% of frames had no "
+              f"drone. If the cage was in view for those,\n     the corners "
+              f"were probably too dim to pass MIN_CORNER_AREA "
+              f"({cr.get('min_corners')} corners needed).")
+    else:
+        print("\n  clustering looks healthy.")
 
 
 def annotate_run(session):

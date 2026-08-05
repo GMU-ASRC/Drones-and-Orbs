@@ -23,13 +23,17 @@ cannot arm. Run it on two drones, carry them around, point them at each other,
 walk them apart, and watch the console:
 
 ```
-[t=  12.4s] DETECT  ang=( +3.2, -1.1)deg  area=  4210  r= 36.6px  fps=10.0  hit= 94%
+[t=  12.4s] DRONE  4 corners  ang=( +3.2, -1.1)deg  span=130.4px  area=  4210  fps=10.0  hit= 94%
 [t=  18.0s] ....... no target  ( 1.8s)  fps=10.0  hit= 71%
 ```
 
-It prints a summary on exit (hit rate, every dropout, the radius range you
-actually achieved), writes a full session to `logs/bench_<timestamp>/`, and
-then builds the annotated video right there on the drone:
+`4 corners` is the thing to watch: it means the cage's green corners are being
+grouped into one drone rather than tracked individually. On exit you get a
+clustering report with a `LINK_K` recommendation if they are not grouping —
+that is the calibration, and it happens on the drone, no laptop needed.
+
+It also writes a full session to `logs/bench_<timestamp>/` and then builds the
+annotated video right there on the drone:
 
 ```
 logs/bench_<timestamp>/analysis/annotated.mp4    <- copy this off and watch it
@@ -140,6 +144,10 @@ the control loop.
 
 | label | what it means | what to change |
 |---|---|---|
+| `CORNERS_UNCLUSTERED` | corners seen, but too far apart to group | raise `LINK_K` — the message states the value needed |
+| `TOO_FEW_CORNERS` | fewer than `MIN_CORNERS` corners visible | lower `MIN_CORNER_AREA`, or `MIN_CORNERS` to 2 |
+| `CLUSTER_TOO_SMALL` | grouped but too little total area | lower `MIN_CLUSTER_AREA` |
+| `BELOW_MIN_CORNER_AREA` | green survives morphology, no corner-sized blob | lower `MIN_CORNER_AREA` |
 | `HSV_MISS_SAT_LOW` | the target is there but too washed out to pass the saturation floor — usually auto-exposure reacting to a bright LED | lower `HSV_LOWER[1]`; the report gives a number derived from the frames you actually lost |
 | `HSV_MISS_TOO_DARK` | target below the value floor | lower `HSV_LOWER[2]`, or raise exposure |
 | `HSV_MISS_BLOWN_OUT` | over-exposed to white, so it has no hue left | cap exposure / fix AE, not the thresholds |
@@ -158,6 +166,22 @@ python3 ../analysis/analyze_flight.py flight_XXXX --min-area 80
 
 The dropout count and the failure breakdown update immediately, so you can
 converge on thresholds from one flight instead of five.
+
+### Corner clustering
+
+The target is not one green blob — it is the several green corners of a cage.
+The detector finds every corner and groups the ones clustered together; that
+group is the drone, and its centre is the bearing the controller steers on.
+
+Two corners join the same drone when they are close together *relative to their
+own apparent size*. That ratio is range-invariant: corners X apart at range R
+are `X·f/R` px apart, and a corner of size c images at `c·f/R` px, so their
+ratio is `X/c` at every distance. `LINK_K` is that ratio and is the one number
+to calibrate — `vision_test.py` measures it and prints a recommendation.
+
+`LINK_K` too small silently fails to group corners, which looks exactly like
+the original bug. Too large can merge two nearby drones into one. The default
+errs high.
 
 ### If the answer comes back `LEFT_FRAME`
 
