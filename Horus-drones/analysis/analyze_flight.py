@@ -661,24 +661,22 @@ def plot_timeline(path, samples, gaps, logs):
     return True
 
 
-# ============================= main =============================
-def main():
-    ap = argparse.ArgumentParser(
-        description="Analyse a Horus flight/bench log directory.",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("session", help="log directory (flight_* or bench_*)")
-    ap.add_argument("--hsv", nargs=2, metavar=("LOWER", "UPPER"),
-                    help="override thresholds, e.g. --hsv 35,40,40 85,255,255")
-    ap.add_argument("--min-area", type=int, help="override MIN_AREA")
-    ap.add_argument("--no-video-out", action="store_true",
-                    help="skip writing annotated.mp4 (much faster)")
-    ap.add_argument("--max-frames", type=int, default=0,
-                    help="stop after N frames (quick look)")
-    args = ap.parse_args()
+# ============================= analysis =============================
+def analyze_session(session, hsv=None, min_area=None, write_video=True,
+                    max_frames=0, quiet=False):
+    """Analyse one log directory. Returns a summary dict, or None if there was
+    no readable video.
 
-    session = os.path.abspath(args.session)
+    Importable so vision_test.py can annotate a bench run in place, without
+    shelling out or duplicating the pipeline.
+    """
+    def say(msg):
+        if not quiet:
+            print(msg, flush=True)
+
+    session = os.path.abspath(session)
     if not os.path.isdir(session):
-        sys.exit(f"not a directory: {session}")
+        raise NotADirectoryError(session)
     out_dir = os.path.join(session, "analysis")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -689,13 +687,13 @@ def main():
     cfg.setdefault("min_area", 150)
     cfg.setdefault("open_k", 3)
     cfg.setdefault("close_k", 21)
-    if args.hsv:
-        cfg["hsv_lower"] = [int(x) for x in args.hsv[0].split(",")]
-        cfg["hsv_upper"] = [int(x) for x in args.hsv[1].split(",")]
-        print(f"[analyze] HSV override {cfg['hsv_lower']}..{cfg['hsv_upper']}")
-    if args.min_area:
-        cfg["min_area"] = args.min_area
-        print(f"[analyze] MIN_AREA override {cfg['min_area']}")
+    if hsv:
+        cfg["hsv_lower"] = [int(x) for x in hsv[0].split(",")]
+        cfg["hsv_upper"] = [int(x) for x in hsv[1].split(",")]
+        say(f"[analyze] HSV override {cfg['hsv_lower']}..{cfg['hsv_upper']}")
+    if min_area:
+        cfg["min_area"] = min_area
+        say(f"[analyze] MIN_AREA override {cfg['min_area']}")
 
     vision = load_csv(os.path.join(session, "vision.csv"))
     logs = {
@@ -712,14 +710,22 @@ def main():
 
     cap, vpath = open_video(session)
     if cap is None:
-        sys.exit(f"no readable video in {session} "
-                 f"(expected video.h264 or video.mp4)")
-    print(f"[analyze] video: {os.path.basename(vpath)}")
+        say(f"[analyze] no readable video in {session} "
+            f"(expected video.h264 or video.mp4)")
+        return None
+    say(f"[analyze] video: {os.path.basename(vpath)}")
+
+    # Frame rate for the annotated output. Trust the recorder's configured
+    # CAPTURE_FPS over the container: a raw .h264 has no timing, and OpenCV
+    # reports a default 25 fps for it, which would play the result 2.5x fast.
+    out_fps = cfg.get("capture_fps") or cap.get(cv2.CAP_PROP_FPS) or 10.0
+    if not (1 <= out_fps <= 120):
+        out_fps = 10.0
 
     pts = load_pts(os.path.join(session, "video.pts"))
     align, align_mode = build_alignment(pts, vision)
-    print(f"[analyze] alignment: {align_mode} "
-          f"({len(vision)} vision rows, {len(pts)} pts)")
+    say(f"[analyze] alignment: {align_mode} "
+        f"({len(vision)} vision rows, {len(pts)} pts)")
 
     det = Detector(cfg)
     writer = None
@@ -731,14 +737,14 @@ def main():
         ok, frame = cap.read()
         if not ok:
             break
-        if args.max_frames and i >= args.max_frames:
+        if max_frames and i >= max_frames:
             break
 
         res = det.run(frame)
         row = align.get(i, {})
         t = row.get("t_mono")
         if t is None:
-            t = i / 10.0                       # no csv row: assume 10 fps
+            t = i / out_fps                    # no csv row: fall back to rate
         if t0 is None:
             t0 = t
         reason, detail = diagnose(res, det, last_bbox, frame.shape)
@@ -769,27 +775,25 @@ def main():
                 px = st["pix"]
                 miss_pix.append(px[::max(1, len(px) // 1000)])
 
-        if not args.no_video_out:
+        if write_video:
             if writer is None:
-                fps = cap.get(cv2.CAP_PROP_FPS) or 10.0
-                if not (1 <= fps <= 120):
-                    fps = 10.0
                 h, w = frame.shape[:2]
                 writer = cv2.VideoWriter(
                     os.path.join(out_dir, "annotated.mp4"),
-                    cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                    cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (w, h))
             writer.write(annotate(frame, res, samples[-1], cfg))
 
         i += 1
         if i % 250 == 0:
-            print(f"[analyze] {i} frames...", flush=True)
+            say(f"[analyze] {i} frames...")
 
     cap.release()
     if writer:
         writer.release()
 
     if not samples:
-        sys.exit("no frames decoded")
+        say("[analyze] no frames decoded")
+        return None
 
     gaps = find_dropouts(samples)
     pixels = np.concatenate(hsv_pix) if hsv_pix else None
@@ -809,21 +813,61 @@ def main():
         if not s["accepted"]:
             reasons[s["reason"]] = reasons.get(s["reason"], 0) + 1
 
-    print(f"\n--- {os.path.basename(session)} ---")
-    print(f"  frames            : {len(samples)}")
-    print(f"  detected          : {hit} ({100.0 * hit / len(samples):.1f}%)")
-    print(f"  dropouts >={DROPOUT_S}s   : {len(longg)}")
-    for r, c in sorted(reasons.items(), key=lambda kv: -kv[1])[:6]:
-        print(f"    {r:<22} {c}")
-    if hsv_rec:
-        print(f"  HSV capture       : {hsv_rec['captured_pct']}% of target px")
-        print(f"  suggested lower   : {hsv_rec['suggested_lower']}")
-    print(f"\n  report   : {report}")
-    if not args.no_video_out:
-        print(f"  annotated: {os.path.join(out_dir, 'annotated.mp4')}")
-    if plotted:
-        print(f"  timeline : {os.path.join(out_dir, 'timeline.png')}")
+    return {
+        "session": session, "out_dir": out_dir, "frames": len(samples),
+        "detected": hit, "hit_pct": round(100.0 * hit / len(samples), 1),
+        "dropouts": len(longg), "reasons": reasons, "hsv": hsv_rec,
+        "report": report,
+        "annotated": os.path.join(out_dir, "annotated.mp4") if write_video
+        else None,
+        "timeline": os.path.join(out_dir, "timeline.png") if plotted else None,
+    }
+
+
+def print_summary(r):
+    """Console summary of an analyze_session() result."""
+    print(f"\n--- {os.path.basename(r['session'])} ---")
+    print(f"  frames            : {r['frames']}")
+    print(f"  detected          : {r['detected']} ({r['hit_pct']}%)")
+    print(f"  dropouts >={DROPOUT_S}s   : {r['dropouts']}")
+    for reason, c in sorted(r["reasons"].items(), key=lambda kv: -kv[1])[:6]:
+        print(f"    {reason:<22} {c}")
+    if r["hsv"]:
+        print(f"  HSV capture       : {r['hsv']['captured_pct']}% of target px")
+        print(f"  suggested lower   : {r['hsv']['suggested_lower']}")
+    print(f"\n  report   : {r['report']}")
+    if r["annotated"]:
+        print(f"  annotated: {r['annotated']}")
+    if r["timeline"]:
+        print(f"  timeline : {r['timeline']}")
     print()
+
+
+# ============================== cli ==============================
+def main():
+    ap = argparse.ArgumentParser(
+        description="Analyse a Horus flight/bench log directory.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("session", help="log directory (flight_* or bench_*)")
+    ap.add_argument("--hsv", nargs=2, metavar=("LOWER", "UPPER"),
+                    help="override thresholds, e.g. --hsv 35,40,40 85,255,255")
+    ap.add_argument("--min-area", type=int, help="override MIN_AREA")
+    ap.add_argument("--no-video-out", action="store_true",
+                    help="skip writing annotated.mp4 (much faster)")
+    ap.add_argument("--max-frames", type=int, default=0,
+                    help="stop after N frames (quick look)")
+    args = ap.parse_args()
+
+    try:
+        res = analyze_session(args.session, hsv=args.hsv,
+                              min_area=args.min_area,
+                              write_video=not args.no_video_out,
+                              max_frames=args.max_frames)
+    except NotADirectoryError as e:
+        sys.exit(f"not a directory: {e}")
+    if res is None:
+        sys.exit(1)
+    print_summary(res)
 
 
 def annotate(frame, res, s, cfg):

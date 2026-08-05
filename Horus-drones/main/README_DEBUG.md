@@ -28,7 +28,18 @@ walk them apart, and watch the console:
 ```
 
 It prints a summary on exit (hit rate, every dropout, the radius range you
-actually achieved) and writes a full session to `logs/bench_<timestamp>/`.
+actually achieved), writes a full session to `logs/bench_<timestamp>/`, and
+then builds the annotated video right there on the drone:
+
+```
+logs/bench_<timestamp>/analysis/annotated.mp4    <- copy this off and watch it
+```
+
+That is the footage with the detection mask, the blob box and the reason each
+frame failed drawn onto it. Building it takes roughly as long as the run
+itself on a Zero 2W, so a 120 s test needs a couple of minutes afterwards.
+Ctrl-C during that step is safe — the logs are already written, and you can
+run the analyzer later on a faster machine. `--no-annotate` skips it entirely.
 
 **This is the fastest way to split the problem in half.** If detection drops
 out while you are walking the drones by hand — no yaw steps, no vibration, no

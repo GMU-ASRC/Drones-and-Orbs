@@ -10,7 +10,11 @@ produces, so the same analyzer explains what the detector did:
 
     python3 vision_test.py                    # until Ctrl-C
     python3 vision_test.py -d 120             # stop after 2 minutes
-    python3 ../analysis/analyze_flight.py logs/bench_<timestamp>
+
+When the run ends it builds `analysis/annotated.mp4` inside the log directory:
+the footage with the detection mask, the blob box and the reason each frame
+failed drawn onto it. Copy that off the drone and watch it. Pass --no-annotate
+to skip, and run analysis/analyze_flight.py later on a faster machine instead.
 
 Because it never touches DroneController, this is also the safe way to test
 camera changes: no mavlink connection is opened, so nothing can arm.
@@ -31,6 +35,7 @@ Live console output tells you what it is doing while you walk:
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -57,6 +62,8 @@ def main():
                     help="skip device-stats logging (system.csv)")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="no per-detection console output")
+    ap.add_argument("--no-annotate", action="store_true",
+                    help="don't build analysis/annotated.mp4 after the run")
     args = ap.parse_args()
 
     log = FlightLogger(tag=args.tag)
@@ -166,8 +173,50 @@ def main():
             print(f"  radius range         : {r_min:.0f}-{r_max:.0f} px "
                   f"(R_CLUMP=60, R_DECLUMP=25)")
         print(f"\n  logs: {log.dir}")
-        print(f"  analyse: python3 ../analysis/analyze_flight.py {log.dir}\n")
         log.close()
+
+        if not args.no_annotate:
+            annotate_run(log.dir)
+        else:
+            print(f"  analyse: python3 ../analysis/analyze_flight.py "
+                  f"{log.dir}\n")
+
+
+def annotate_run(session):
+    """Build annotated.mp4 + report.md straight after the run.
+
+    Deliberately done AFTER capture rather than live: annotating and encoding
+    in Python costs far more than the hardware H.264 path, and doing it during
+    capture would distort the frame timing this tool exists to measure. The
+    drone is not flying here, so the wait costs nothing but patience -- expect
+    roughly real-time on a Zero 2W (a 120 s run takes a couple of minutes).
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "analysis"))
+    try:
+        from analyze_flight import analyze_session, print_summary
+    except Exception as e:
+        print(f"\n  [annotate] analyzer unavailable ({e})")
+        print(f"  copy the log off and run:\n"
+              f"    python3 analysis/analyze_flight.py {session}\n")
+        return
+    print("\n  building annotated video (Ctrl-C to skip, logs are safe)...")
+    try:
+        res = analyze_session(session)
+    except KeyboardInterrupt:
+        print(f"\n  skipped. run later:\n"
+              f"    python3 ../analysis/analyze_flight.py {session}\n")
+        return
+    except Exception as e:
+        print(f"  [annotate] failed: {e}")
+        print(f"  logs are intact; retry with:\n"
+              f"    python3 ../analysis/analyze_flight.py {session}\n")
+        return
+    if res is None:
+        print("  [annotate] nothing to analyse (no video recorded?)\n")
+        return
+    print_summary(res)
+    print(f"  watch: {res['annotated']}\n")
 
 
 if __name__ == "__main__":
