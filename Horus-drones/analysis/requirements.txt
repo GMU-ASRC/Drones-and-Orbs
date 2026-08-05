@@ -1,0 +1,12 @@
+# Laptop-side analysis only -- do NOT install these on the Pi.
+# The flight code (main/) adds no new dependencies beyond what the Pi already
+# has (picamera2, opencv, numpy, pymavlink); everything it logs is read from
+# /proc and /sys directly.
+opencv-python
+numpy
+matplotlib        # optional: without it you still get report.md + annotated.mp4
+
+# ffmpeg is also needed, from your package manager rather than pip:
+#   sudo apt install ffmpeg      /      sudo pacman -S ffmpeg
+# It remuxes the Pi's raw .h264 into a seekable .mp4. Without it the analyzer
+# falls back to reading the raw stream, which works but reports no frame rate.
