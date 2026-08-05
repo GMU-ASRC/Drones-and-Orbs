@@ -6,7 +6,7 @@ from pymavlink import mavutil
 
 # ---- config ----
 CONN_STR      = 'udpout:127.0.0.1:14551'   # your dedicated mavp2p endpoint
-TAKEOFF_ALT   = 1.0     # meters above start point
+TAKEOFF_ALT   = 3.0     # meters above start point
 HOVER_SECONDS = 10.0
 RATE_HZ       = 20.0
 DT            = 1.0 / RATE_HZ

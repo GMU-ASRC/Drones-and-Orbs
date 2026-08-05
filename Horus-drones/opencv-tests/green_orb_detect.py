@@ -71,6 +71,7 @@ try:
     while True:
         t0 = time.time()
         frame = picam2.capture_array()
+        frame[380:480, 500:640] = 0
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  ok_k)
