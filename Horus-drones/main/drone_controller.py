@@ -106,7 +106,7 @@ class DroneController:
 
         self.home = None                     # (x0, y0, z0, yaw0) at connect
         self._lp_stamp = 0.0
-        sself._rot_step = 0.0                 # rad per step (step-and-stare)
+        self._rot_step = 0.0                 # rad per step (step-and-stare)
         self._rot_next_t = 0.0               # when to take the next step
         self._rot_dwell = 1.0                # s between steps    
 
