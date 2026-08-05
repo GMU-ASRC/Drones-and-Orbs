@@ -70,9 +70,9 @@ import cv2
 import numpy as np
 from picamera2 import Picamera2
 
-from corner_cluster import (ClusterParams, cluster_corners,
-                            extract_corners, nearest_ratio,
-                            summarize_cluster)
+from corner_cluster import (ClusterParams, adaptive_link_ratio,
+                            cluster_corners, extract_corners,
+                            nearest_ratio, summarize_cluster)
 from flight_logger import NullLogger
 
 # --------------------------- TUNABLES ---------------------------
@@ -104,14 +104,15 @@ MIN_AREA   = 150          # legacy single-blob threshold, kept for reference
 # knowing X, c or R. (It also survives cage rotation, which shrinks the
 # projected separation but never grows it past the face-on value.)
 MIN_CORNER_AREA  = 20     # px: smallest blob accepted as a corner
-LINK_K           = 18.0   # link two corners if gap <= LINK_K * mean corner radius
-                          #   PROVISIONAL -- depends on your cage's corner
-                          #   spacing over corner size, which has not been
-                          #   measured yet. vision_test.py prints the value
-                          #   observed in the run and recommends a new one.
-                          #   Too small silently fails to group corners, which
-                          #   looks exactly like the original bug; too large
-                          #   can merge two nearby drones. Erring high.
+AUTO_LINK        = True   # derive the link ratio from each frame's corners.
+                          # Leave this on: a fixed ratio has to be re-measured
+                          # for every cage/corner-size combination, and when it
+                          # is too small it silently stops grouping corners --
+                          # indistinguishable from the original bug.
+LINK_SLACK       = 2.2    # adaptive threshold = LINK_SLACK * median nearest-
+                          # neighbour ratio. Single-linkage chains from there.
+LINK_K           = 18.0   # fallback ratio, used only when AUTO_LINK is off or
+                          # fewer than 3 corners are visible to measure from
 SCALE_RATIO_MAX  = 5.0    # never link corners whose radii differ by more than
                           # this: they are at different ranges, so different drones
 MIN_CORNERS      = 2      # clustered blobs needed before we call it a drone
@@ -138,6 +139,7 @@ EDGE_MARGIN_PX  = 40          # "was leaving the frame" test for lose events
 # session.json so the analyzer reproduces this exact configuration
 CLUSTER = ClusterParams(
     min_corner_area=MIN_CORNER_AREA, link_k=LINK_K,
+    auto_link=AUTO_LINK, link_slack=LINK_SLACK,
     scale_ratio_max=SCALE_RATIO_MAX, min_corners=MIN_CORNERS,
     min_cluster_area=MIN_CLUSTER_AREA, max_blobs=MAX_BLOBS,
 )
@@ -148,7 +150,7 @@ VISION_FIELDS = [
     "mask_raw_px", "mask_px", "n_comp", "best_area", "accepted",
     "cx", "cy", "ang_x", "ang_y", "radius", "span_px", "n_corners",
     "corner_r_med", "sep_ratio", "n_found", "min_sep_ratio",
-    "n_clusters", "jump_px",
+    "n_clusters", "jump_px", "link_k_used",
     "bbox_x", "bbox_y", "bbox_w", "bbox_h", "near_edge",
     "exp_us", "gain", "dgain", "lux", "awb_r", "awb_b",
 ]
@@ -211,7 +213,7 @@ class CameraController:
         # cage geometry can be calibrated on the drone, without a laptop
         self._cl = {"frames": 0, "with_corners": 0, "sum_found": 0,
                     "max_found": 0, "clustered": 0, "per_drone": {},
-                    "unclustered": [], "spans": []}
+                    "unclustered": [], "spans": [], "link_k": []}
 
     # ------------------------- lifecycle -------------------------
     def start(self):
@@ -245,6 +247,7 @@ class CameraController:
             "hsv_upper": HSV_UPPER.tolist(), "open_k": OPEN_K,
             "close_k": CLOSE_K, "min_area": MIN_AREA,
             "min_corner_area": MIN_CORNER_AREA, "link_k": LINK_K,
+            "auto_link": AUTO_LINK, "link_slack": LINK_SLACK,
             "scale_ratio_max": SCALE_RATIO_MAX, "min_corners": MIN_CORNERS,
             "min_cluster_area": MIN_CLUSTER_AREA,
             "track_gate_k": TRACK_GATE_K,
@@ -347,8 +350,14 @@ class CameraController:
             "per_drone": dict(sorted(c["per_drone"].items())),
             "unclustered": len(c["unclustered"]),
             "link_k": CLUSTER.link_k,
+            "auto_link": CLUSTER.auto_link,
             "min_corners": CLUSTER.min_corners,
         }
+        if c["link_k"]:
+            lk = sorted(c["link_k"])
+            out["link_k_used_med"] = round(lk[len(lk) // 2], 1)
+            out["link_k_used_min"] = round(lk[0], 1)
+            out["link_k_used_max"] = round(lk[-1], 1)
         if c["spans"]:
             s = sorted(c["spans"])
             out["span_min"] = round(s[0], 1)
@@ -510,6 +519,8 @@ class CameraController:
         # to -- the whole calibration in one number.
         mr = nearest_ratio(corners)
         row["min_sep_ratio"] = round(mr, 1) if mr is not None else ""
+        auto_k = adaptive_link_ratio(corners, CLUSTER)
+        row["link_k_used"] = round(auto_k, 1)
 
         det = None
         clusters = cluster_corners(corners, CLUSTER)
@@ -524,6 +535,8 @@ class CameraController:
             c["with_corners"] += 1
         if clusters:
             c["clustered"] += 1
+            if len(c["link_k"]) < 5000:
+                c["link_k"].append(auto_k)
         elif len(corners) >= CLUSTER.min_corners and mr is not None:
             # corners were visible but refused to group: the separation that
             # failed is exactly what LINK_K needs to cover

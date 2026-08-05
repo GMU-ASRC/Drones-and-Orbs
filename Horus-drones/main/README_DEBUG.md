@@ -29,8 +29,9 @@ walk them apart, and watch the console:
 
 `4 corners` is the thing to watch: it means the cage's green corners are being
 grouped into one drone rather than tracked individually. On exit you get a
-clustering report with a `LINK_K` recommendation if they are not grouping —
-that is the calibration, and it happens on the drone, no laptop needed.
+clustering report — corner counts, the auto-derived link ratio, and the cage
+span converted to metres. There is nothing to calibrate from it; it is there so
+you can see the detector agreeing with reality.
 
 It also writes a full session to `logs/bench_<timestamp>/` and then builds the
 annotated video right there on the drone:
@@ -54,10 +55,17 @@ are where to look.
 ## 2. Then fly
 
 ```bash
-python3 clump_declump.py
+python3 clump_declump_2.py        # corner-cluster detector, ranges in metres
 ```
 
-Same as before, but each run writes `logs/flight_<timestamp>/`.
+Writes `logs/flight2_<timestamp>/` and builds the annotated video after
+landing, same as the bench test. Set the standoff you want in metres at the top
+of the file — `CLUMP_RANGE_M`, `DECLUMP_RANGE_M`. Nothing else to configure.
+
+`clump_declump.py` (the original) is kept unchanged for reference, but **do not
+fly it with this detector**: it ranges on blob area, which the corner clustering
+changed the meaning of, and its `R_CLUMP` threshold can no longer be reached at
+any distance — `APPROACH` would never end and it would keep closing.
 
 ## 3. Pull the logs and analyse
 
@@ -144,14 +152,13 @@ the control loop.
 
 | label | what it means | what to change |
 |---|---|---|
-| `CORNERS_UNCLUSTERED` | corners seen, but too far apart to group | raise `LINK_K` — the message states the value needed |
+| `CORNERS_UNCLUSTERED` | corners seen, but too far apart to group | rare with `AUTO_LINK`; if it appears, raise `LINK_SLACK` — the message states the ratio observed |
 | `TOO_FEW_CORNERS` | fewer than `MIN_CORNERS` corners visible | lower `MIN_CORNER_AREA`, or `MIN_CORNERS` to 2 |
 | `CLUSTER_TOO_SMALL` | grouped but too little total area | lower `MIN_CLUSTER_AREA` |
 | `BELOW_MIN_CORNER_AREA` | green survives morphology, no corner-sized blob | lower `MIN_CORNER_AREA` |
 | `HSV_MISS_SAT_LOW` | the target is there but too washed out to pass the saturation floor — usually auto-exposure reacting to a bright LED | lower `HSV_LOWER[1]`; the report gives a number derived from the frames you actually lost |
 | `HSV_MISS_TOO_DARK` | target below the value floor | lower `HSV_LOWER[2]`, or raise exposure |
 | `HSV_MISS_BLOWN_OUT` | over-exposed to white, so it has no hue left | cap exposure / fix AE, not the thresholds |
-| `BELOW_MIN_AREA` | seen and rejected on size — this is your range limit | lower `MIN_AREA`, and check it against `R_DECLUMP` |
 | `FRAGMENTED` | broke into sub-threshold pieces | raise `CLOSE_K`, or widen HSV |
 | `MORPH_ERODED` | passed HSV, removed by `OPEN_K` | lower `OPEN_K` |
 | `LEFT_FRAME` | last seen at the frame edge, then gone | a pointing problem, not a detection one — see below |
@@ -176,12 +183,43 @@ group is the drone, and its centre is the bearing the controller steers on.
 Two corners join the same drone when they are close together *relative to their
 own apparent size*. That ratio is range-invariant: corners X apart at range R
 are `X·f/R` px apart, and a corner of size c images at `c·f/R` px, so their
-ratio is `X/c` at every distance. `LINK_K` is that ratio and is the one number
-to calibrate — `vision_test.py` measures it and prints a recommendation.
+ratio is `X/c` at every distance.
 
-`LINK_K` too small silently fails to group corners, which looks exactly like
-the original bug. Too large can merge two nearby drones into one. The default
-errs high.
+**That ratio is derived per frame, not configured.** Each corner's nearest
+neighbour is the adjacent corner, so the median nearest-neighbour ratio is the
+cage's own corner spacing, measured live; single-linkage chains around the rest
+of the cage from there. A fixed `LINK_K` had to be re-measured for every
+cage/corner-size combination, and when set too small it silently stopped
+grouping corners — indistinguishable from the original bug. Across seven cage
+geometries the adaptive ratio grouped 4/4 corners every time, where a fixed
+18.0 failed completely on two of them.
+
+## Ranging: no calibration
+
+`clump_declump_2.py` works in **metres**, not pixels. `range_estimator.py`
+converts apparent cage span to range with the pinhole relation
+`span = C / range`, and gets `C` two ways:
+
+- a **prior** from geometry already known — focal length from `PROC_RES` and
+  `HFOV_DEG`, cage width from the 18-inch cage — good enough to fly on from the
+  first frame;
+- a **refinement solved in flight from parallax**. While closing, range falls
+  by exactly the distance flown, which the EKF reports, so `1/span` is linear
+  in distance flown with slope `-1/C`. A straight-line fit gives `C` with no
+  assumption about the cage's size at all.
+
+In closed-loop simulation the drone stopped at the same 2.15 m whether the cage
+was 0.30 m, 0.457 m or 0.70 m — the prior was wrong by ±50% in two of those and
+parallax corrected it, recovering the true cage size to within 4%.
+
+The fit is adopted only when well conditioned (enough travel, enough span
+change, R² ≥ 0.90) and only within 2× of the prior, so a bad fit falls back to
+the prior rather than producing a wrong range. `MIN_RANGE_M` is an
+unconditional floor underneath all of it.
+
+There is a geometric floor too: an 18-inch cage fills a 24.3° frame at ~1.06 m,
+and beyond that its corners leave the FOV and span stops growing. Startup warns
+if `CLUMP_RANGE_M` is set inside that limit.
 
 ### If the answer comes back `LEFT_FRAME`
 

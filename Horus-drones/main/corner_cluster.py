@@ -42,7 +42,13 @@ class ClusterParams:
     records them into session.json, so the analyzer can rebuild the exact
     configuration a given recording was made with."""
     min_corner_area: int = 20      # px: smallest blob accepted as a corner
-    link_k: float = 14.0           # link if gap <= link_k * mean corner radius
+    link_k: float = 18.0           # fallback link ratio when auto is off or
+                                   # there are too few corners to measure one
+    auto_link: bool = True         # derive the link ratio per frame (below)
+    link_slack: float = 2.2        # adaptive threshold = slack * median
+                                   # nearest-neighbour ratio
+    link_min: float = 4.0          # clamp on the adaptive value
+    link_max: float = 45.0
     scale_ratio_max: float = 5.0   # max corner-radius ratio within one drone
     min_corners: int = 2           # corners required to call a cluster a drone
     min_cluster_area: int = 60     # total px across the cluster
@@ -89,6 +95,48 @@ def _sep(a, b):
     return math.hypot(a[CX] - b[CX], a[CY] - b[CY])
 
 
+def adaptive_link_ratio(corners, p: ClusterParams):
+    """Derive the link threshold from the corners in this frame.
+
+    Removes the need to measure the cage by hand. Each corner's NEAREST
+    neighbour is, for a cage in view, the adjacent corner -- so the median
+    nearest-neighbour ratio is the cage's own corner spacing expressed in
+    corner-radii, measured live. Allowing a small multiple of that
+    (`link_slack`) is enough, because single-linkage then chains around the
+    rest of the cage; we never need to span the whole thing in one hop.
+
+    It is self-scaling in the two ways that matter: the ratio is already
+    range-invariant, and clutter far from any cage has a large nearest-
+    neighbour ratio, so it raises the threshold only for itself, not enough to
+    swallow a genuinely separate drone.
+
+    Falls back to the fixed link_k when there are too few corners to have an
+    opinion.
+    """
+    n = len(corners)
+    if not p.auto_link or n < 3:
+        return p.link_k
+    nn = []
+    for i in range(n):
+        best = None
+        for j in range(n):
+            if i == j:
+                continue
+            r = 0.5 * (corners[i][RAD] + corners[j][RAD])
+            if r <= 0:
+                continue
+            ratio = _sep(corners[i], corners[j]) / r
+            if best is None or ratio < best:
+                best = ratio
+        if best is not None:
+            nn.append(best)
+    if not nn:
+        return p.link_k
+    nn.sort()
+    med = nn[len(nn) // 2]
+    return max(p.link_min, min(p.link_max, med * p.link_slack))
+
+
 def cluster_corners(corners, p: ClusterParams):
     """Single-linkage grouping of corners into candidate drones.
 
@@ -102,6 +150,7 @@ def cluster_corners(corners, p: ClusterParams):
     n = len(corners)
     if n == 0:
         return []
+    link_k = adaptive_link_ratio(corners, p)
     parent = list(range(n))
 
     def find(a):
@@ -116,7 +165,7 @@ def cluster_corners(corners, p: ClusterParams):
             lo, hi = min(ri, rj), max(ri, rj)
             if lo <= 0 or hi / lo > p.scale_ratio_max:
                 continue                        # different ranges
-            if _sep(corners[i], corners[j]) <= p.link_k * 0.5 * (ri + rj):
+            if _sep(corners[i], corners[j]) <= link_k * 0.5 * (ri + rj):
                 a, b = find(i), find(j)
                 if a != b:
                     parent[a] = b

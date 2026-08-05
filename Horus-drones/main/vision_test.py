@@ -203,32 +203,38 @@ def print_cluster_report(cr, log):
     if cr["per_drone"]:
         dist = "  ".join(f"{k}:{v}" for k, v in cr["per_drone"].items())
         print(f"  corners per drone    : {dist}")
+    if "link_k_used_med" in cr:
+        print(f"  auto link ratio      : {cr['link_k_used_min']} .. "
+              f"{cr['link_k_used_med']} .. {cr['link_k_used_max']}  "
+              f"(derived per frame, nothing to set)")
     if "span_med" in cr:
         print(f"  cage span (px)       : {cr['span_min']} .. "
               f"{cr['span_med']} .. {cr['span_max']}")
-        print("      span is the apparent cage width and the better range "
-              "proxy than area.\n      Note the value at your intended clump "
-              "standoff -- R_CLUMP in\n      clump_declump.py still measures "
-              "blob area and needs recalibrating.")
+        # span -> metres, using the same estimator the flight script flies on
+        try:
+            from camera_controller import HFOV_DEG, PROC_RES
+            from range_estimator import RangeEstimator
+            est = RangeEstimator.from_camera(PROC_RES[0], HFOV_DEG)
+            print(f"  implied range (m)    : "
+                  f"{est.range_m(cr['span_max']):.1f} .. "
+                  f"{est.range_m(cr['span_med']):.1f} .. "
+                  f"{est.range_m(cr['span_min']):.1f}   "
+                  f"(prior scale; refined in flight from parallax)")
+        except Exception:
+            pass
     log.add_meta("clustering", cr)
 
     if cr["avg_found"] < 1.0:
         print("\n  !! almost no green corners found. This is a colour/exposure "
               "problem,\n     not a clustering one -- check the annotated "
               "video and HSV first.")
-    elif "suggest_link_k" in cr:
-        print(f"\n  !! {cr['unclustered']} frames had corners that did NOT "
-              f"group.")
-        print(f"     Their closest pairs sat {cr['unclustered_p90_ratio']} "
-              f"corner-radii apart,\n     but LINK_K is {cr['link_k']}. To "
-              f"hold them together set, in camera_controller.py:")
-        print(f"\n         LINK_K = {cr['suggest_link_k']}\n")
-        print("     Then re-run this test and check 'frames clustered' rises.")
     elif cr["clustered_pct"] < 80:
         print(f"\n  note: {100 - cr['clustered_pct']:.0f}% of frames had no "
-              f"drone. If the cage was in view for those,\n     the corners "
-              f"were probably too dim to pass MIN_CORNER_AREA "
-              f"({cr.get('min_corners')} corners needed).")
+              f"drone. If the cage was in view for those, the corners\n"
+              f"     were probably too dim or small to pass MIN_CORNER_AREA "
+              f"({cr['min_corners']} corners needed).\n"
+              f"     Check the annotated video: grey circles are corners that "
+              f"were found\n     but not grouped, cyan are the ones that were.")
     else:
         print("\n  clustering looks healthy.")
 

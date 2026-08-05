@@ -324,6 +324,13 @@ class DroneController:
     def yaw_deg(self) -> float:
         return math.degrees(self._att.yaw) if self._att else 0.0
 
+    def position(self):
+        """(x, y, z) in LOCAL_NED metres from the EKF origin, or None.
+        Used to measure how far the drone has actually flown, which is what
+        lets range_estimator solve for scale from parallax."""
+        lp = self._lp
+        return (lp.x, lp.y, lp.z) if lp is not None else None
+
     # ========================== internals ==========================
     def _set_pos_sp(self, x, y, z, yaw):
         with self._lock:

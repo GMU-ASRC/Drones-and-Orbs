@@ -33,16 +33,28 @@ the instantaneous value. Losing a corner only ever shrinks the measurement, so
 the recent maximum is both the better estimate and the conservative one -- it
 errs toward "closer than you think", which stops early rather than late.
 
-Calibration is mandatory
-------------------------
-SPAN_CLUMP and SPAN_DECLUMP are in pixels and depend on your cage size, the
-lens and the standoff you actually want. They cannot be guessed. Run
+No calibration step
+-------------------
+Distances here are in METRES, not pixels, and nothing needs measuring by hand.
+range_estimator converts span to range using the pinhole relation
+span = C / range, and obtains C two ways:
 
-    python3 vision_test.py -d 60
+  * a prior from geometry already known -- focal length from PROC_RES and
+    HFOV_DEG, cage width from the 18-inch Horus cage -- which is good enough to
+    fly on from the first frame;
+  * a refinement solved in flight from parallax. While closing, range falls by
+    exactly the distance flown, which the EKF reports, and 1/span is then
+    linear in distance flown with slope -1/C. A straight-line fit gives C with
+    no assumption about the cage's size at all.
 
-holding two drones at the separation you want them to settle at, read
-`cage span (px)` from the clustering report, put it in SPAN_CLUMP below, and
-set SPAN_CALIBRATED = True. Until you do, this script refuses to fly.
+The refinement is adopted only when the fit is well conditioned and within a
+bounded factor of the prior, so a bad fit falls back to the prior rather than
+producing a wrong range. MIN_RANGE_M is an unconditional floor underneath all
+of it.
+
+The corner-clustering link threshold is likewise derived per frame from the
+corners themselves (corner_cluster.adaptive_link_ratio), so it needs no
+measuring either.
 
 State machine (unchanged):
 
@@ -55,13 +67,15 @@ CSVs, events -- plus the annotated video built automatically after landing.
 """
 
 import argparse
+import math
 import time
 from collections import deque
 
-from camera_controller import CameraController
+from camera_controller import CameraController, HFOV_DEG, PROC_RES
 from drone_controller import DroneController
 from flight_logger import FlightLogger
 from post_run import annotate_run
+from range_estimator import RangeEstimator
 from system_monitor import SystemMonitor
 
 # ============================ CONFIG ============================
@@ -75,20 +89,25 @@ SEARCH_YAW_DPS    = 15.0    # NOTE: DroneController.rotate() ignores this and
 # -- detection freshness --
 FRESH_S           = 0.5     # detection older than this = target lost
 
-# ---------------- RANGE CALIBRATION (REQUIRED) ------------------
-# Apparent cage width in px. Bigger span = closer.
-SPAN_CALIBRATED   = False   # set True once the two values below are measured
-SPAN_CLUMP        = 280.0   # span at the standoff you want to settle at
-SPAN_DECLUMP      = 120.0   # span at "far enough apart again"
-SPAN_DEADBAND     = 15.0    # px hysteresis around SPAN_CLUMP (anti-hunting)
-SPAN_WINDOW_S     = 0.5     # take the max span over this window (see docstring)
+# ------------------------- RANGE (METRES) -----------------------
+# Distances, not pixels. range_estimator converts apparent cage span to metres
+# from the camera geometry, and refines the scale in flight from parallax --
+# nothing here needs measuring by hand.
+CLUMP_RANGE_M     = 2.0     # settle this far from the other drone.
+                            # Bounded below by the FOV: an 18-inch cage fills
+                            # a 24.3 deg frame at ~1.06 m, and corners start
+                            # clipping well before that. Startup checks this
+                            # and warns if you ask for something too close.
+DECLUMP_RANGE_M   = 4.0     # "far enough apart again"
+RANGE_DEADBAND_M  = 0.15    # arrival tolerance (anti-hunting)
+MIN_RANGE_M       = 1.2     # hard floor: never command forward inside this,
+                            # whatever the estimator says
+SPAN_WINDOW_S     = 1.0     # take the max span over this window (see docstring)
 MIN_CORNERS_TRUST = 2       # ignore detections built from fewer corners
 # ----------------------------------------------------------------
 
 # -- approach --
-KP_FWD            = 0.003   # m/s per px of span error. Lower than the old
-                            # radius gain because span errors are far larger:
-                            # 0.003 * 170 px ~= VFWD_MAX.
+KP_FWD            = 0.35    # m/s per metre of range error
 VFWD_MAX          = 0.5     # m/s cap during approach
 KP_YAW            = 2.0     # deg/s of yaw per deg of bearing error
 CENTER_TOL_DEG    = 4.0     # only translate when centered within this
@@ -111,6 +130,7 @@ DT = 1.0 / LOOP_HZ
 BEHAVIOR_FIELDS = [
     "t_mono", "iter", "state", "state_t", "loop_lag_ms",
     "fresh", "det_age", "ang_x", "ang_y", "span", "span_used", "n_corners",
+    "range_m", "range_c", "range_cal", "travelled_m",
     "radius", "area", "cmd", "vx", "vy", "yaw_rate", "alt_agl", "yaw_deg",
     "cam_fps",
 ]
@@ -150,46 +170,20 @@ class SpanTracker:
             self._q.popleft()
 
 
-def preflight_check():
-    """Refuse to fly on uncalibrated range constants.
-
-    This is the failure that made clump_declump.py unsafe with the new
-    detector: an arrival threshold that can never be reached leaves APPROACH
-    commanding forward velocity all the way into the other drone. A hard stop
-    here is the cheapest possible guard against repeating it.
-    """
-    if SPAN_CALIBRATED:
-        return True
-    print(__doc__.split("Calibration is mandatory")[1].split("State machine")[0])
-    print("REFUSING TO FLY: SPAN_CALIBRATED is False in clump_declump_2.py.\n"
-          "Measure SPAN_CLUMP first -- an uncalibrated approach threshold "
-          "cannot be\nreached, and the drone would keep closing until it hit "
-          "something.\n")
-    return False
-
-
 def main():
     ap = argparse.ArgumentParser(description="Clump/declump on the corner-"
                                              "cluster detector.")
     ap.add_argument("--no-annotate", action="store_true",
                     help="don't build analysis/annotated.mp4 after landing")
-    ap.add_argument("--force-uncalibrated", action="store_true",
-                    help="fly with uncalibrated span constants (NOT ADVISED)")
     args = ap.parse_args()
-
-    if not preflight_check() and not args.force_uncalibrated:
-        return 1
-    if args.force_uncalibrated and not SPAN_CALIBRATED:
-        print("!! flying UNCALIBRATED at your own risk -- keep the kill "
-              "switch ready\n")
 
     log = FlightLogger(tag="flight2")
     log.add_meta("behavior", {
         "script": "clump_declump_2", "range_proxy": "span_px",
         "altitude_m": ALTITUDE_M, "fresh_s": FRESH_S,
-        "span_calibrated": SPAN_CALIBRATED,
-        "span_clump": SPAN_CLUMP, "span_declump": SPAN_DECLUMP,
-        "span_deadband": SPAN_DEADBAND, "span_window_s": SPAN_WINDOW_S,
+        "clump_range_m": CLUMP_RANGE_M, "declump_range_m": DECLUMP_RANGE_M,
+        "range_deadband_m": RANGE_DEADBAND_M, "min_range_m": MIN_RANGE_M,
+        "span_window_s": SPAN_WINDOW_S,
         "min_corners_trust": MIN_CORNERS_TRUST,
         "kp_fwd": KP_FWD, "vfwd_max": VFWD_MAX, "kp_yaw": KP_YAW,
         "center_tol_deg": CENTER_TOL_DEG,
@@ -205,6 +199,29 @@ def main():
     cam = CameraController(log)
     drone = DroneController(logger=log)
     spans = SpanTracker()
+    rng = RangeEstimator.from_camera(PROC_RES[0], HFOV_DEG)
+    span_at_clump = rng.span_for(CLUMP_RANGE_M)
+    log.event("behavior", f"range prior C={rng.c_prior:.0f} px*m "
+                          f"({CLUMP_RANGE_M:.1f} m <-> "
+                          f"{span_at_clump:.0f} px span of "
+                          f"{PROC_RES[0]} px frame)")
+    # A cage wider than the frame cannot be measured: its outer corners leave
+    # the FOV, span stops growing, and the approach would never register
+    # arrival -- the same class of unreachable threshold as before, arrived at
+    # geometrically instead of by miscalibration.
+    if span_at_clump > 0.80 * PROC_RES[0]:
+        log.event("behavior",
+                  f"WARN CLUMP_RANGE_M={CLUMP_RANGE_M:.1f} m puts the cage at "
+                  f"{span_at_clump:.0f} px across a {PROC_RES[0]} px frame. "
+                  f"Corners will clip and span will stop growing. Minimum "
+                  f"usable range is about "
+                  f"{rng.c_prior / (0.80 * PROC_RES[0]):.1f} m at this FOV.")
+    travelled = 0.0                        # metres flown while closing in
+    prev_pos = None
+    closing = False                        # were we commanding forward last
+                                           # tick? set at the end of APPROACH,
+                                           # consumed by the next tick's
+                                           # position delta
 
     state = 'INIT'
     t_state = time.monotonic()
@@ -255,6 +272,19 @@ def main():
                 span_used = spans.update(det.span_px, loop_t0)
             else:
                 span_used = spans.value(loop_t0)
+            range_m = rng.range_m(span_used) if span_used > 0 else float("inf")
+
+            # distance actually flown, for the parallax fit. Only accumulated
+            # while closing head-on, which is the only time path length is a
+            # fair stand-in for range closed.
+            pos = drone.position()
+            if pos is not None:
+                if prev_pos is not None and state == 'APPROACH' and closing:
+                    travelled += math.dist(pos[:2], prev_pos[:2])
+                    if fresh:
+                        rng.add(span_used, travelled)
+                prev_pos = pos
+            closing = False
 
             # what we commanded this tick, recorded to behavior.csv
             cmd, vx, vy, yaw_cmd = '-', 0.0, 0.0, 0.0
@@ -282,12 +312,20 @@ def main():
 
                     # Arrival is "within the deadband of the target standoff",
                     # NOT "at or past it". The two must agree: the deadband
-                    # zeroes vx once err < SPAN_DEADBAND, so a test for
-                    # span >= SPAN_CLUMP would leave the drone parked just
-                    # short of a threshold it has stopped moving toward, and
+                    # zeroes vx once the error is inside RANGE_DEADBAND_M, so
+                    # testing the bare threshold would leave the drone parked
+                    # just short of a target it had stopped moving toward, and
                     # APPROACH would never end. (clump_declump.py has this
                     # mismatch: it stops closing at radius 52 but waits for 60.)
-                    if span_used >= SPAN_CLUMP - SPAN_DEADBAND:
+                    if range_m <= CLUMP_RANGE_M + RANGE_DEADBAND_M:
+                        cmd = 'hold'
+                        drone.hold()
+                        goto('CLUMPED')
+                    elif range_m <= MIN_RANGE_M:
+                        # unconditional floor: whatever the estimator thinks,
+                        # do not press in past this
+                        log.event("behavior", f"MIN_RANGE_M floor hit at "
+                                              f"{range_m:.2f} m -> clumping")
                         cmd = 'hold'
                         drone.hold()
                         goto('CLUMPED')
@@ -297,10 +335,11 @@ def main():
                         drone.move_body(0.0, 0.0, yaw_cmd)
                     else:
                         # centered: close the distance, keep correcting yaw.
-                        # err > SPAN_DEADBAND here by the branch above.
-                        err = SPAN_CLUMP - span_used
+                        # err > RANGE_DEADBAND_M here by the branch above.
+                        err = range_m - CLUMP_RANGE_M
                         vx = clamp(KP_FWD * err, VFWD_MAX)
                         cmd = 'approach'
+                        closing = vx > 0.05
                         drone.move_body(vx, 0.0, yaw_cmd)
 
             # ======================= CLUMPED ======================
@@ -319,7 +358,7 @@ def main():
                     log.event("behavior", "declump time cap")
                     goto('DONE')
                 elif fresh:
-                    if span_used <= SPAN_DECLUMP:
+                    if range_m >= DECLUMP_RANGE_M:
                         goto('DONE')       # far enough, visually confirmed
                     else:
                         # back straight away, keep the target centered so we
@@ -353,6 +392,9 @@ def main():
                 ang_y=round(det.ang_y, 2) if fresh else "",
                 span=round(det.span_px, 1) if fresh else "",
                 span_used=round(span_used, 1),
+                range_m=(round(range_m, 2) if range_m != float("inf") else ""),
+                range_c=round(rng.c, 1), range_cal=int(rng.calibrated),
+                travelled_m=round(travelled, 2),
                 n_corners=det.n_corners if fresh else "",
                 radius=round(det.radius, 1) if fresh else "",
                 area=det.area if fresh else "",
