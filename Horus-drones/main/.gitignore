@@ -1,0 +1,5 @@
+# flight recordings and logs -- large, per-run, never useful in git
+/logs
+/detections
+__pycache__/
+*.pyc
