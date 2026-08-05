@@ -41,6 +41,7 @@ import time
 
 from camera_controller import CameraController
 from flight_logger import FlightLogger
+from post_run import annotate_run
 from system_monitor import SystemMonitor
 
 # --------------------------- TUNABLES ---------------------------
@@ -230,43 +231,6 @@ def print_cluster_report(cr, log):
               f"({cr.get('min_corners')} corners needed).")
     else:
         print("\n  clustering looks healthy.")
-
-
-def annotate_run(session):
-    """Build annotated.mp4 + report.md straight after the run.
-
-    Deliberately done AFTER capture rather than live: annotating and encoding
-    in Python costs far more than the hardware H.264 path, and doing it during
-    capture would distort the frame timing this tool exists to measure. The
-    drone is not flying here, so the wait costs nothing but patience -- expect
-    roughly real-time on a Zero 2W (a 120 s run takes a couple of minutes).
-    """
-    sys.path.insert(0, os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "analysis"))
-    try:
-        from analyze_flight import analyze_session, print_summary
-    except Exception as e:
-        print(f"\n  [annotate] analyzer unavailable ({e})")
-        print(f"  copy the log off and run:\n"
-              f"    python3 analysis/analyze_flight.py {session}\n")
-        return
-    print("\n  building annotated video (Ctrl-C to skip, logs are safe)...")
-    try:
-        res = analyze_session(session)
-    except KeyboardInterrupt:
-        print(f"\n  skipped. run later:\n"
-              f"    python3 ../analysis/analyze_flight.py {session}\n")
-        return
-    except Exception as e:
-        print(f"  [annotate] failed: {e}")
-        print(f"  logs are intact; retry with:\n"
-              f"    python3 ../analysis/analyze_flight.py {session}\n")
-        return
-    if res is None:
-        print("  [annotate] nothing to analyse (no video recorded?)\n")
-        return
-    print_summary(res)
-    print(f"  watch: {res['annotated']}\n")
 
 
 if __name__ == "__main__":
