@@ -1,37 +1,4 @@
 #!/usr/bin/env python3
-"""
-system_monitor.py -- Pi Zero 2W health + network connectivity logging.
-
-Purpose: when the Pi "drops connection" mid-flight, this tells you whether the
-cause was the Pi (brown-out, thermal throttle, CPU starvation, SD stall) or the
-network (wifi signal, interface down, packet loss) -- without guessing.
-
-Everything here reads /proc and /sys directly. No psutil, no iwconfig: the
-Horus Pis run 32-bit Pi OS Lite and we are not adding pip dependencies to the
-flight image. The only subprocess calls are `vcgencmd` (throttle flags, already
-on Pi OS) and `ping`, both optional and both failure-tolerant.
-
-The four signals that actually matter on this airframe
-------------------------------------------------------
-1. `uv_now` / `uv_occurred` -- the Pi is powered off the flight controller's
-   telemetry rail (see Horus README, phase 1 step 1). When the motors pull hard
-   the battery sags, the 5 V rail sags, and the Pi under-volts. Under-voltage
-   is the single most common cause of a Zero 2W dropping wifi or resetting.
-   Cross-reference these against `batt_v` in link.csv.
-2. `sched_lag_s` -- this thread asks to wake every SAMPLE_S. If it wakes 3 s
-   late, the whole Pi stalled (SD-card I/O block, CPU starvation, swap). A
-   stall long enough to starve the setpoint stream makes PX4 leave offboard.
-3. `wifi_level_dbm` / `link_up` -- straightforward radio-side answer.
-4. `ping_rtt_ms` -- end-to-end reachability of the gateway; -1 means the packet
-   was lost. Separates "wifi associated but useless" from "wifi gone".
-
-Usage:
-    mon = SystemMonitor(logger)
-    mon.start()
-    ...
-    mon.stop()
-"""
-
 import os
 import re
 import shutil
@@ -39,21 +6,21 @@ import subprocess
 import threading
 import time
 
-# --------------------------- TUNABLES ---------------------------
-SAMPLE_S       = 1.0      # device-stats sample period
-VCGENCMD_EVERY = 2        # run vcgencmd every N samples (it forks; keep low)
-PING_S         = 5.0      # gateway reachability probe period (0 = disabled)
-PING_HOST      = None     # None = auto-detect default gateway from /proc/net/route
+
+SAMPLE_S       = 1.0
+VCGENCMD_EVERY = 2
+PING_S         = 5.0
+PING_HOST      = None
 PING_TIMEOUT_S = 2
 
-WIFI_IFACE     = None     # None = first interface listed in /proc/net/wireless
+WIFI_IFACE     = None
 
-# alert thresholds -- crossing these writes an event to events.log
-LAG_WARN_S     = 0.75     # scheduling lag that means the Pi stalled
+
+LAG_WARN_S     = 0.75
 TEMP_WARN_C    = 75.0
 MEM_WARN_MB    = 40.0
 WIFI_WARN_DBM  = -75.0
-# ----------------------------------------------------------------
+
 
 SYS_FIELDS = [
     "t_mono", "t_wall", "sched_lag_s",
@@ -69,7 +36,6 @@ SYS_FIELDS = [
 ]
 
 
-# =========================== helpers ===========================
 def _read(path, default=""):
     try:
         with open(path) as f:
@@ -86,11 +52,10 @@ def _read_int(path, default=-1):
 
 
 def _default_gateway():
-    """Parse the default route out of /proc/net/route (little-endian hex)."""
     try:
         for line in _read("/proc/net/route").splitlines()[1:]:
             f = line.split()
-            if len(f) > 2 and f[1] == "00000000":       # destination 0.0.0.0
+            if len(f) > 2 and f[1] == "00000000":
                 g = int(f[2], 16)
                 return ".".join(str((g >> (8 * i)) & 0xFF) for i in range(4))
     except Exception:
@@ -99,7 +64,6 @@ def _default_gateway():
 
 
 def _wifi_iface():
-    """First interface in /proc/net/wireless, or None if no wifi at all."""
     try:
         for line in _read("/proc/net/wireless").splitlines()[2:]:
             if ":" in line:
@@ -110,8 +74,6 @@ def _wifi_iface():
 
 
 def device_info() -> dict:
-    """Static facts about this Pi. Captured once into session.json so a log
-    reviewed weeks later still says which board and OS produced it."""
     info = {
         "hostname": (_read("/proc/sys/kernel/hostname").strip() or "?"),
         "model": _read("/proc/device-tree/model", "?").strip("\x00").strip(),
@@ -141,7 +103,6 @@ def device_info() -> dict:
     return info
 
 
-# ========================= the monitor =========================
 class SystemMonitor:
     def __init__(self, logger, sample_s: float = SAMPLE_S):
         self._log = logger
@@ -154,20 +115,20 @@ class SystemMonitor:
         self._iface = WIFI_IFACE or _wifi_iface()
         self._ping_host = PING_HOST or _default_gateway()
 
-        # rolling state for delta-based metrics
+
         self._cpu_prev = None
         self._proc_prev = None
         self._net_prev = None
         self._n = 0
 
-        # cached values from the slower probes
+
         self._vc_cache = {}
         self._ping = (-1.0, 100.0)
 
-        # so each alert fires on transition, not every second
+
         self._alerted = set()
 
-    # ------------------------- lifecycle -------------------------
+
     def start(self):
         if self._running:
             return
@@ -199,7 +160,7 @@ class SystemMonitor:
         if self._csv:
             self._csv.flush()
 
-    # --------------------------- loops ---------------------------
+
     def _stats_loop(self):
         next_t = time.monotonic()
         while self._running:
@@ -208,10 +169,10 @@ class SystemMonitor:
             if s > 0:
                 time.sleep(s)
             else:
-                next_t = time.monotonic()       # fell behind; resync
+                next_t = time.monotonic()
 
             now = time.monotonic()
-            # positive = we woke late. Large values mean the Pi stalled.
+
             lag = max(0.0, now - next_t)
             try:
                 row = self._sample(now, lag)
@@ -222,8 +183,6 @@ class SystemMonitor:
             self._n += 1
 
     def _ping_loop(self):
-        """Separate thread: ping blocks for up to PING_TIMEOUT_S and we do not
-        want that showing up as scheduling lag in the stats loop."""
         while self._running:
             rtt, loss = -1.0, 100.0
             try:
@@ -251,7 +210,7 @@ class SystemMonitor:
                     return
                 time.sleep(0.25)
 
-    # -------------------------- sampling --------------------------
+
     def _sample(self, now, lag) -> dict:
         row = {"t_mono": round(now, 3), "t_wall": round(time.time(), 3),
                "sched_lag_s": round(lag, 3)}
@@ -277,9 +236,6 @@ class SystemMonitor:
         return row
 
     def _cpu(self):
-        """Aggregate + per-core utilisation from /proc/stat deltas. Per-core
-        matters here: Python is GIL-bound, so one core pegged at 100% while the
-        others idle is the signature of the CV loop saturating its thread."""
         out, cur = {}, {}
         try:
             for line in _read("/proc/stat").splitlines():
@@ -288,7 +244,7 @@ class SystemMonitor:
                 f = line.split()
                 name = f[0]
                 vals = [int(x) for x in f[1:11]]
-                cur[name] = (sum(vals), vals[3] + vals[4])      # total, idle
+                cur[name] = (sum(vals), vals[3] + vals[4])
             if self._cpu_prev:
                 for name, (tot, idle) in cur.items():
                     ptot, pidle = self._cpu_prev.get(name, (tot, idle))
@@ -326,10 +282,6 @@ class SystemMonitor:
         return {"cpu_temp_c": round(t / 1000.0, 1)} if t > 0 else {}
 
     def _vcgencmd(self):
-        """Throttle/under-voltage bitmask + core voltage. Bit meanings:
-        0 under-voltage now, 1 arm freq capped now, 2 throttled now,
-        16 under-voltage has occurred, 17 capped has occurred,
-        18 throttling has occurred."""
         out = {}
         try:
             r = subprocess.run([self._vc, "get_throttled"],
@@ -358,7 +310,7 @@ class SystemMonitor:
         out = {}
         if not self._iface:
             return out
-        # association quality: link / level(dBm) / noise
+
         try:
             for line in _read("/proc/net/wireless").splitlines()[2:]:
                 if line.strip().startswith(self._iface + ":"):
@@ -371,7 +323,7 @@ class SystemMonitor:
             pass
         out["link_up"] = int(
             _read(f"/sys/class/net/{self._iface}/operstate").strip() == "up")
-        # byte/error counters -> rates
+
         try:
             for line in _read("/proc/net/dev").splitlines()[2:]:
                 name, _, rest = line.partition(":")
@@ -395,12 +347,10 @@ class SystemMonitor:
         return out
 
     def _proc(self):
-        """This process's own CPU and memory -- distinguishes 'the Pi is busy'
-        from 'our Python is busy'."""
         out = {}
         try:
             f = _read("/proc/self/stat").rsplit(") ", 1)[1].split()
-            jiff = (int(f[11]) + int(f[12]))         # utime + stime
+            jiff = (int(f[11]) + int(f[12]))
             now = time.monotonic()
             if self._proc_prev:
                 pj, pt = self._proc_prev
@@ -420,10 +370,8 @@ class SystemMonitor:
             pass
         return out
 
-    # --------------------------- alerts ---------------------------
+
     def _alerts(self, row):
-        """Edge-triggered warnings into events.log. Edge- not level-triggered
-        so a sustained problem is one line, not one line per second."""
         def edge(key, bad, msg_bad, msg_ok=None):
             if bad and key not in self._alerted:
                 self._alerted.add(key)
@@ -434,7 +382,7 @@ class SystemMonitor:
                     self._log.event("sysmon", msg_ok)
 
         if row.get("sched_lag_s", 0) > LAG_WARN_S:
-            # not edge-triggered: every stall is its own event worth seeing
+
             self._log.event("sysmon", f"WARN scheduler lag "
                                       f"{row['sched_lag_s']:.2f}s -- Pi stalled")
         edge("uv", row.get("uv_now") == 1,
