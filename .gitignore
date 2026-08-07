@@ -4,3 +4,4 @@ log/
 logs/
 
 __pycache__
+.venv/
