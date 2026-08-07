@@ -1,53 +1,7 @@
 #!/usr/bin/env python3
-"""
-analyze_flight.py -- offline post-flight analysis of a Horus log directory.
-
-Runs on your laptop, not the Pi. Point it at a session directory produced by
-main/clump_declump.py or main/vision_test.py:
-
-    python3 analyze_flight.py ../main/logs/flight_20260805_141233
-
-What it does
-------------
-1. Re-runs the EXACT detection pipeline over the recorded video, frame by
-   frame -- including the corner clustering, imported from corner_cluster.py
-   rather than reimplemented, so the analysis cannot drift from what flew.
-2. For every frame where the target was not detected, works out WHY, by
-   inspecting the region where the target was last seen:
-
-     CORNERS_UNCLUSTERED   corners were found but did not group into a drone.
-                     Carries the closest-pair separation in corner-radii, so it
-                     tells you what to raise LINK_K to.
-     TOO_FEW_CORNERS corners found, but fewer than MIN_CORNERS.
-     CLUSTER_TOO_SMALL     grouped, but under MIN_CLUSTER_AREA.
-     BELOW_MIN_CORNER_AREA green pixels survived morphology but no blob was
-                     even corner-sized.
-     HSV_MISS        nothing passed the colour threshold. The ROI report then
-                     says which channel failed -- S too low (washed out), V too
-                     low (too dark), or hue outside the window.
-     MORPH_ERODED    pixels passed the threshold but open/close removed them.
-     LEFT_FRAME      the target was at the frame edge on the last good frame.
-                     With HFOV 24.3 deg this is what a yaw step looks like.
-     NO_TARGET       genuinely nothing green anywhere.
-
-   These have different fixes, which is the entire point of separating them.
-3. Measures the actual HSV distribution of the target across the flight and
-   recommends HSV_LOWER/HSV_UPPER that would have kept it.
-4. Correlates every dropout with behavior state, setpoint stream health,
-   scheduler lag and under-voltage from the other logs -- so a dropout caused
-   by the Pi stalling is not misread as a vision problem.
-5. Writes analysis/annotated.mp4 (video + mask + HUD + reason), report.md and,
-   if matplotlib is present, timeline.png.
-
-Try new thresholds against the recording without re-flying:
-
-    python3 analyze_flight.py <session> --hsv 35,40,40 85,255,255 --min-area 80
-"""
-
 import argparse
 import csv
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -56,34 +10,24 @@ import sys
 import cv2
 import numpy as np
 
-# The detector's corner grouping, imported rather than reimplemented so the
-# analysis always describes the code that actually flew. corner_cluster.py is
-# stdlib-only for exactly this reason -- importing it does not drag in picamera2.
+
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "main"))
-from corner_cluster import (ClusterParams, cluster_corners,      # noqa: E402
-                            extract_corners, nearest_ratio,
-                            summarize_cluster)
+from cage_detector import CageDetector, CageParams
 
-# frames whose gap from the previous detection exceeds this are "dropouts"
+
 DROPOUT_S = 0.5
 EDGE_MARGIN_PX = 40
-ROI_EXPAND = 1.8          # how far around the last bbox we look for the target
-HSV_SAMPLE_CAP = 400_000  # pixels retained for the threshold recommendation
+ROI_EXPAND = 1.8
+HSV_SAMPLE_CAP = 400_000
 
-# Below these, a pixel carries no usable colour: OpenCV's hue is arbitrary when
-# saturation approaches zero, and meaningless when the pixel is near black. The
-# ROI must clear both before we are willing to blame a colour channel -- without
-# this guard, empty grey background reads as "the target desaturated", which
-# sends you tuning HSV for a target that had simply left the frame.
+
 S_FLOOR = 25
 V_FLOOR = 25
-BLOWN_V = 235             # ROI this bright is an over-exposed target
-MIN_COLOURED_FRAC = 0.05  # coloured share of the ROI below which it is just
-                          # background and the target really is absent
+BLOWN_V = 235
+MIN_COLOURED_FRAC = 0.05
 
 
-# ============================ loading ============================
 def load_json(path, default=None):
     try:
         with open(path) as f:
@@ -93,7 +37,6 @@ def load_json(path, default=None):
 
 
 def load_csv(path):
-    """CSV -> list of dicts with numbers coerced. Missing file -> []."""
     if not os.path.exists(path):
         return []
     out = []
@@ -116,7 +59,6 @@ def load_csv(path):
 
 
 def load_pts(path):
-    """picamera2 writes one presentation timestamp (ms) per encoded frame."""
     if not os.path.exists(path):
         return []
     out = []
@@ -133,8 +75,6 @@ def load_pts(path):
 
 
 def open_video(session):
-    """Raw .h264 has no container timing, so remux to mp4 with ffmpeg when we
-    can -- OpenCV then reports a sane frame count and fps."""
     mp4 = os.path.join(session, "video.mp4")
     h264 = os.path.join(session, "video.h264")
     if not os.path.exists(mp4) and os.path.exists(h264):
@@ -159,15 +99,7 @@ def open_video(session):
     return None, None
 
 
-# ========================== alignment ==========================
 def build_alignment(pts_ms, vision):
-    """Map video frame index -> vision.csv row.
-
-    Preferred path: video.pts holds each encoded frame's sensor timestamp
-    offset in ms and vision.csv holds absolute sensor_ts_s, so we match on
-    time and tolerate any dropped frames on either side. Otherwise fall back
-    to positional matching.
-    """
     ts = [r.get("sensor_ts_s") for r in vision]
     have_ts = [t for t in ts if isinstance(t, (int, float))]
     if pts_ms and len(have_ts) > 10:
@@ -178,88 +110,49 @@ def build_alignment(pts_ms, vision):
         for i, p in enumerate(pts_ms):
             target = base + p / 1000.0
             j = int(np.nanargmin(np.abs(rows_t - target)))
-            if abs(rows_t[j] - target) < 0.15:      # within 1.5 frames @10fps
+            if abs(rows_t[j] - target) < 0.15:
                 mapping[i] = vision[j]
         if len(mapping) > 0.5 * len(pts_ms):
             return mapping, "timestamp"
     return {i: vision[i] for i in range(min(len(vision), 10 ** 7))}, "index"
 
 
-# ========================== detection ==========================
 class Detector:
-    """Mirror of camera_controller's pipeline, plus the diagnostics that were
-    too expensive to compute in flight.
-
-    The target is a CLUSTER of green cage corners, not the largest blob -- see
-    corner_cluster.py. `prev` carries the previous frame's target so the
-    continuity gate behaves as it did in flight.
-    """
 
     def __init__(self, cfg):
-        self.lower = np.array(cfg["hsv_lower"], dtype=np.uint8)
-        self.upper = np.array(cfg["hsv_upper"], dtype=np.uint8)
-        self.min_area = cfg["min_area"]
-        self.p = ClusterParams.from_cfg(cfg)
-        self.gate_k = float(cfg.get("track_gate_k", 4.0))
-        self.open_k = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (cfg["open_k"], cfg["open_k"]))
-        self.close_k = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (cfg["close_k"], cfg["close_k"]))
-        self.prev = None                    # (cx, cy, span)
+        params = CageParams()
+        for field in vars(params):
+            if cfg.get(field) is not None:
+                setattr(params, field,
+                        type(getattr(params, field))(cfg[field]))
+        self.params = params
+        self.detector = CageDetector(params)
 
     def run(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        raw = cv2.inRange(hsv, self.lower, self.upper)
-        mask = cv2.morphologyEx(raw, cv2.MORPH_OPEN, self.open_k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.close_k)
-        num, _, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
-
-        corners = extract_corners(stats, cent, self.p)
-        clusters = cluster_corners(corners, self.p)
-        best = max((c[2] for c in corners), default=0)
-
-        chosen = None
-        if clusters:
-            summaries = [summarize_cluster(g) for g in clusters]
-            if self.prev is not None:
-                px, py, pspan = self.prev
-                gate = self.gate_k * max(pspan, 20.0)
-                near = [(math.hypot(g["cx"] - px, g["cy"] - py), g)
-                        for g in summaries]
-                near = [t for t in near if t[0] <= gate]
-                if near:
-                    near.sort(key=lambda t: t[0])
-                    chosen = near[0][1]
-            if chosen is None:
-                chosen = max(summaries, key=lambda g: (g["n"], g["area"]))
-            self.prev = (chosen["cx"], chosen["cy"], chosen["span"])
-
+        cage, corners = self.detector.detect(hsv)
+        mask = self.detector.mask()
+        stats = self.detector.stats
         return {
-            "hsv": hsv, "raw": raw, "mask": mask,
-            "raw_px": int(cv2.countNonZero(raw)),
-            "mask_px": int(cv2.countNonZero(mask)),
-            "n_comp": int(num - 1), "best": int(best),
-            "areas": sorted((c[2] for c in corners), reverse=True),
-            "corners": corners, "n_found": len(corners),
-            "n_clusters": len(clusters),
-            "min_sep_ratio": nearest_ratio(corners),
-            "cluster": chosen,
-            "bbox": chosen["bbox"] if chosen else None,
-            "centroid": (chosen["cx"], chosen["cy"]) if chosen else None,
-            "accepted": chosen is not None,
+            "hsv": hsv, "mask": mask,
+            "raw_px": stats.loose_px, "mask_px": stats.mask_px,
+            "n_comp": stats.components,
+            "best": corners[0].area if corners else 0,
+            "areas": [c.area for c in corners],
+            "corners": corners, "n_found": stats.corners_found,
+            "n_clusters": stats.groups,
+            "quality": cage.score if cage else None,
+            "weak": bool(cage.from_fallback) if cage else False,
+            "span": cage.span_px if cage else 0.0,
+            "span_floor": cage.span_floor_px if cage else 0.0,
+            "cluster": cage,
+            "bbox": cage.box if cage else None,
+            "centroid": (cage.x, cage.y) if cage else None,
+            "accepted": cage is not None,
         }
 
 
 def roi_stats(hsv, bbox, shape):
-    """HSV statistics where the target was last seen. This is what turns
-    'no detection' into 'saturation collapsed to 31, threshold is 60'.
-
-    Percentiles are taken over the COLOURED pixels of the ROI, not all of it.
-    The ROI is deliberately larger than the target (ROI_EXPAND) so it can catch
-    a target that moved, which means background usually outnumbers target
-    pixels -- a plain median then describes the background and the channel that
-    actually failed gets averaged away.
-    """
     if bbox is None:
         return None
     h, w = shape[:2]
@@ -290,47 +183,42 @@ def roi_stats(hsv, bbox, shape):
 
 
 def diagnose(res, det_cfg, last_bbox, shape):
-    """Why was there no accepted detection on this frame?"""
     if res["accepted"]:
         return "OK", ""
-    lower, upper = det_cfg.lower, det_cfg.upper
-    p = det_cfg.p
+    p = det_cfg.params
+    lower = np.array((p.hue_low, p.saturation_low, p.value_low), dtype=np.uint8)
+    upper = np.array((p.hue_high, 255, 255), dtype=np.uint8)
 
-    # Corners were visible but no drone came out of them. Which of the two
-    # cluster gates rejected them is the whole diagnosis.
     if res["n_found"] > 0:
-        if res["n_found"] < p.min_corners:
+        if res["n_found"] < p.min_corners_per_cage:
             return "TOO_FEW_CORNERS", (
-                f"only {res['n_found']} corner(s) above MIN_CORNER_AREA "
-                f"({p.min_corner_area}px); need {p.min_corners}")
-        r = res["min_sep_ratio"]
-        if r is not None and r > p.link_k:
-            return "CORNERS_UNCLUSTERED", (
-                f"{res['n_found']} corners, closest pair {r:.1f} corner-radii "
-                f"apart but LINK_K={p.link_k} -- raise LINK_K to ~{r * 1.15:.0f}")
+                f"only {res['n_found']} corner(s) above min_corner_area "
+                f"({p.min_corner_area}px); need {p.min_corners_per_cage}")
+        if res["n_clusters"] == 0:
+            return "CORNERS_UNGROUPED", (
+                f"{res['n_found']} corners but none linked -- they are not "
+                f"mutual neighbours within link_reach={p.link_reach} or "
+                f"link_spacing={p.link_spacing}")
         total = sum(res["areas"])
         if total < p.min_cluster_area:
             return "CLUSTER_TOO_SMALL", (
                 f"{res['n_found']} corners totalling {total}px < "
-                f"MIN_CLUSTER_AREA {p.min_cluster_area}")
-        return "CLUSTER_REJECTED", (
-            f"{res['n_found']} corners, closest pair "
-            f"{r if r is None else round(r, 1)} radii, but no cluster survived "
-            f"(check SCALE_RATIO_MAX={p.scale_ratio_max})")
+                f"min_cluster_area {p.min_cluster_area}")
+        return "QUALITY_TOO_LOW", (
+            f"{res['n_clusters']} group(s) from {res['n_found']} corners, none "
+            f"reached min_quality={p.min_quality} or all implied a range "
+            f"beyond max_range_m={p.max_range_m} m")
 
-    # nothing even reached corner size
     if res["mask_px"] > 0:
         return "BELOW_MIN_CORNER_AREA", (
             f"{res['mask_px']}px of mask but largest blob {res['best']}px < "
-            f"MIN_CORNER_AREA {p.min_corner_area}")
+            f"min_corner_area {p.min_corner_area}")
 
     if res["raw_px"] > 0 and res["mask_px"] == 0:
         return "MORPH_ERODED", (f"{res['raw_px']}px passed HSV but open/close "
                                 f"removed all of it")
 
-    # Nothing passed the colour threshold. Look where the target was last seen
-    # and decide whether something target-like is still there (a colour/exposure
-    # problem) or whether the ROI is just background (the target is gone).
+
     if last_bbox is None:
         return "NO_TARGET", "no pixels in the HSV window anywhere in frame"
 
@@ -343,17 +231,16 @@ def diagnose(res, det_cfg, last_bbox, shape):
     at_edge = (x < EDGE_MARGIN_PX or y < EDGE_MARGIN_PX or
                x + bw > w - EDGE_MARGIN_PX or y + bh > h - EDGE_MARGIN_PX)
 
-    # An over-exposed target is bright and colourless, so it fails the colour
-    # plausibility gate by definition -- test for it first, on the whole ROI.
+
     if st["all_v"] > BLOWN_V and st["all_s"] < lower[1]:
-        return "HSV_MISS_BLOWN_OUT", (f"ROI is bright and colourless "
+        return "HSV_MISS_BLOWN_OUT", (f"ROI is bright and colorless "
                                       f"(V={st['all_v']:.0f}, "
                                       f"S={st['all_s']:.0f}) -- over-exposed")
 
     if st["frac"] >= MIN_COLOURED_FRAC and "h" in st:
         hm, sm, vm = st["h"][1], st["s"][1], st["v"][1]
         hi_s, hi_v = st["s"][2], st["v"][2]
-        detail = (f"coloured {100 * st['frac']:.0f}% of ROI, median "
+        detail = (f"colored {100 * st['frac']:.0f}% of ROI, median "
                   f"HSV=({hm:.0f},{sm:.0f},{vm:.0f}) p90 S={hi_s:.0f} "
                   f"V={hi_v:.0f} vs lower=({lower[0]},{lower[1]},{lower[2]})")
         if lower[0] <= hm <= upper[0]:
@@ -363,9 +250,8 @@ def diagnose(res, det_cfg, last_bbox, shape):
                 return "HSV_MISS_TOO_DARK", detail
         return "HSV_MISS", detail
 
-    # ROI is background (near-zero saturation or near-black), so the target is
-    # not there to be mis-thresholded -- it is gone.
-    detail = (f"ROI is background ({100 * st['frac']:.0f}% coloured, "
+
+    detail = (f"ROI is background ({100 * st['frac']:.0f}% colored, "
               f"S={st['all_s']:.0f} V={st['all_v']:.0f}); target not present")
     if at_edge:
         return "LEFT_FRAME", (f"last seen at frame edge "
@@ -373,9 +259,7 @@ def diagnose(res, det_cfg, last_bbox, shape):
     return "NO_TARGET", detail
 
 
-# ======================== correlation =========================
 def nearest(rows, key, t):
-    """Row of `rows` whose t_mono is closest to t (rows are time-ordered)."""
     if not rows:
         return None
     best, bd = None, 1e18
@@ -390,7 +274,6 @@ def nearest(rows, key, t):
 
 
 def find_dropouts(samples):
-    """Contiguous runs of not-accepted frames after the first detection."""
     gaps, start = [], None
     seen_any = False
     for s in samples:
@@ -406,16 +289,7 @@ def find_dropouts(samples):
     return gaps
 
 
-# ========================== reporting ==========================
 def recommend_hsv(pixels, missed, cfg):
-    """Thresholds that would have kept the target.
-
-    `pixels` are sampled from frames where detection SUCCEEDED, so on their own
-    they are survivorship-biased: the frames that were lost are precisely the
-    ones whose colour fell outside the window. `missed` carries the coloured
-    ROI pixels from HSV_MISS frames, and the widened recommendation is what it
-    takes to also cover those.
-    """
     if pixels is None or len(pixels) < 500:
         return None
     p = np.percentile(pixels, [1, 2, 50, 98, 99], axis=0)
@@ -437,8 +311,8 @@ def recommend_hsv(pixels, missed, cfg):
         q = np.percentile(missed, [5, 50, 95], axis=0)
         out["missed_n"] = len(missed)
         out["missed_median"] = q[1].astype(int).tolist()
-        # widen only downwards: the lost frames were darker/paler, never more
-        # saturated, so raising the upper bound would just admit more clutter
+
+
         out["widened_lower"] = [
             int(max(0, min(lo[0], q[0][0] - 3))),
             int(max(0, min(lo[1], q[0][1] - 5))),
@@ -535,7 +409,7 @@ def write_report(path, session, cfg, samples, gaps, hsv_rec, logs, meta, align_m
         if "widened_lower" in hsv_rec:
             a(f"Those numbers come only from frames that DID detect, so they "
               f"are survivorship-biased. Sampling the {hsv_rec['missed_n']} "
-              f"coloured pixels present on `HSV_MISS` frames (median "
+              f"colored pixels present on `HSV_MISS` frames (median "
               f"`{hsv_rec['missed_median']}`), the range that would also have "
               f"kept the lost frames is:\n")
             a("```python")
@@ -548,7 +422,7 @@ def write_report(path, session, cfg, samples, gaps, hsv_rec, logs, meta, align_m
               "wrong blob winning the largest-component test.")
             a("")
 
-    # radius vs the thresholds the behavior loop uses
+
     radii = [s["radius"] for s in samples if s["accepted"] and s["radius"]]
     if radii:
         a("## Apparent radius (range proxy)\n")
@@ -564,7 +438,7 @@ def write_report(path, session, cfg, samples, gaps, hsv_rec, logs, meta, align_m
                   f"timeout.")
         a("")
 
-    # health flags worth surfacing even if no dropout lines up with them
+
     sysrows = logs["system"]
     if sysrows:
         a("## Device health\n")
@@ -655,7 +529,7 @@ def plot_timeline(path, samples, gaps, logs):
     except Exception:
         return False
 
-    # everything on seconds-from-first-frame, matching report.md
+
     t0 = samples[0]["t"]
     t = [s["t_rel"] for s in samples]
     fig, ax = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
@@ -702,8 +576,7 @@ def plot_timeline(path, samples, gaps, logs):
     ax[3].set_xlabel("seconds from first frame")
     ax[3].grid(alpha=0.3)
 
-    # shade every dropout across all panels: whatever else dips inside a shaded
-    # band is the thing to suspect
+
     for g0, g1 in gaps:
         if g1["t"] - g0["t"] < DROPOUT_S:
             continue
@@ -718,15 +591,8 @@ def plot_timeline(path, samples, gaps, logs):
     return True
 
 
-# ============================= analysis =============================
 def analyze_session(session, hsv=None, min_area=None, write_video=True,
                     max_frames=0, quiet=False):
-    """Analyse one log directory. Returns a summary dict, or None if there was
-    no readable video.
-
-    Importable so vision_test.py can annotate a bench run in place, without
-    shelling out or duplicating the pipeline.
-    """
     def say(msg):
         if not quiet:
             print(msg, flush=True)
@@ -772,9 +638,7 @@ def analyze_session(session, hsv=None, min_area=None, write_video=True,
         return None
     say(f"[analyze] video: {os.path.basename(vpath)}")
 
-    # Frame rate for the annotated output. Trust the recorder's configured
-    # CAPTURE_FPS over the container: a raw .h264 has no timing, and OpenCV
-    # reports a default 25 fps for it, which would play the result 2.5x fast.
+
     out_fps = cfg.get("capture_fps") or cap.get(cv2.CAP_PROP_FPS) or 10.0
     if not (1 <= out_fps <= 120):
         out_fps = 10.0
@@ -801,7 +665,7 @@ def analyze_session(session, hsv=None, min_area=None, write_video=True,
         row = align.get(i, {})
         t = row.get("t_mono")
         if t is None:
-            t = i / out_fps                    # no csv row: fall back to rate
+            t = i / out_fps
         if t0 is None:
             t0 = t
         reason, detail = diagnose(res, det, last_bbox, frame.shape)
@@ -812,13 +676,13 @@ def analyze_session(session, hsv=None, min_area=None, write_video=True,
             "accepted": res["accepted"], "best": res["best"],
             "raw_px": res["raw_px"], "mask_px": res["mask_px"],
             "n_comp": res["n_comp"],
-            "radius": (g["area"] / np.pi) ** 0.5 if g else None,
-            "span": g["span"] if g else None,
-            "n_corners": g["n"] if g else 0,
+            "radius": ((sum(c.area for c in g.corners) / np.pi) ** 0.5
+                       if g else None),
+            "span": g.span_px if g else None,
+            "span_floor": g.span_floor_px if g else None,
+            "n_corners": len(g.corners) if g else 0,
             "n_found": res["n_found"], "n_clusters": res["n_clusters"],
-            "min_sep_ratio": res["min_sep_ratio"],
-            "sep_ratio": (g["span"] / g["r_med"]
-                          if g and g["r_med"] > 0 else None),
+            "quality": res["quality"], "weak": res["weak"],
             "reason": reason, "detail": detail,
             "state": row.get("state"), "exp_us": row.get("exp_us"),
             "gain": row.get("gain"), "bbox": res["bbox"],
@@ -832,8 +696,8 @@ def analyze_session(session, hsv=None, min_area=None, write_video=True,
                 if len(px):
                     hsv_pix.append(px[::max(1, len(px) // 1500)])
         elif reason.startswith("HSV_MISS") and last_bbox is not None:
-            # what the target actually looked like on the frames we lost --
-            # the un-biased half of the threshold recommendation
+
+
             st = roi_stats(res["hsv"], last_bbox, frame.shape)
             if st is not None and len(st.get("pix", [])) >= 20:
                 px = st["pix"]
@@ -889,7 +753,6 @@ def analyze_session(session, hsv=None, min_area=None, write_video=True,
 
 
 def print_summary(r):
-    """Console summary of an analyze_session() result."""
     print(f"\n--- {os.path.basename(r['session'])} ---")
     print(f"  frames            : {r['frames']}")
     print(f"  detected          : {r['detected']} ({r['hit_pct']}%)")
@@ -907,7 +770,6 @@ def print_summary(r):
     print()
 
 
-# ============================== cli ==============================
 def main():
     ap = argparse.ArgumentParser(
         description="Analyse a Horus flight/bench log directory.",
@@ -935,31 +797,23 @@ def main():
 
 
 def annotate(frame, res, s, cfg):
-    """Frame + green mask tint + bbox + HUD. The reason string is drawn on the
-    frame so scrubbing the video shows you the diagnosis in place."""
     vis = frame.copy()
     tint = np.zeros_like(vis)
     tint[:, :, 1] = res["mask"]
     vis = cv2.addWeighted(vis, 1.0, tint, 0.35, 0)
 
-    # every corner considered: cyan if it made the chosen cluster, grey if not.
-    # Seeing which corners were dropped is the fastest way to spot a LINK_K or
-    # SCALE_RATIO_MAX that is too tight.
-    chosen = res.get("cluster")
-    in_cluster = {(round(c[0], 1), round(c[1], 1))
-                  for c in (chosen["corners"] if chosen else [])}
-    for c in res.get("corners", []):
-        key = (round(c[0], 1), round(c[1], 1))
-        col = (255, 255, 0) if key in in_cluster else (140, 140, 140)
-        cv2.circle(vis, (int(c[0]), int(c[1])), max(3, int(c[3])), col, 1)
 
-    # the links that made it one drone
-    if chosen and len(chosen["corners"]) > 1:
-        pts = chosen["corners"]
+    chosen = res.get("cluster")
+    in_group = {id(c) for c in (chosen.corners if chosen else [])}
+    for c in res.get("corners", []):
+        col = (255, 255, 0) if id(c) in in_group else (140, 140, 140)
+        cv2.circle(vis, (int(c.x), int(c.y)), max(3, int(c.radius)), col, 1)
+
+    if chosen and len(chosen.corners) > 1:
+        pts = [(int(c.x), int(c.y)) for c in chosen.corners]
         for i in range(len(pts)):
             for j in range(i + 1, len(pts)):
-                cv2.line(vis, (int(pts[i][0]), int(pts[i][1])),
-                         (int(pts[j][0]), int(pts[j][1])), (255, 255, 0), 1)
+                cv2.line(vis, pts[i], pts[j], (255, 255, 0), 1)
 
     if res["bbox"]:
         x, y, w, h = res["bbox"]
