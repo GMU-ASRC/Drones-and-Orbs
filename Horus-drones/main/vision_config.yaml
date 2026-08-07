@@ -1,0 +1,56 @@
+provenance:
+  tuned_from: [bench_20260805_151709, flight2_20260805_155954]
+  tuned_on: 2026-08-06
+  tuned_by: analysis/replay_cage.py
+  note: >
+    Field names match cage_detector.CageParams exactly; anything not listed
+    here keeps the dataclass default. Section names are cosmetic.
+    Measured on bench: 94.5% of frames, cage held whole on 96.7% of those,
+    24 px median centroid step. On flight2 the cage is far enough that its
+    markers fall under the core seed and the loose fallback carries it; the
+    detector is weaker there and the annotated video shows it.
+
+color:
+  hue_low: 33
+  hue_high: 90
+  saturation_low: 15
+  value_low: 15
+  core_saturation: 80
+  core_value: 40
+  fallback_frames: 5
+
+morphology:
+  open_kernel: 1
+  close_kernel: 0
+
+corners:
+  min_corner_area: 2
+  min_area_fraction: 0.20
+  max_corner_area: 4000
+  min_corner_fill: 0.30
+  max_corner_aspect: 3.5
+  shape_test_min_area: 20
+  max_corners: 32
+
+grouping:
+  neighbours: 8
+  link_reach: 12.0
+  link_spacing: 2.5
+  max_radius_ratio: 4.0
+
+accept:
+  min_corners_per_cage: 2
+  min_cluster_area: 8
+  min_quality: 0.10
+  max_range_m: 15.0
+
+tracking:
+  continuity_bonus: 1.4
+  continuity_reach: 3.0
+  continuity_hold: 10
+  span_floor_reach: 1.5
+
+roi:
+  roi_margin_px: 60
+  roi_margin_frac: 0.4
+  roi_rescan_frames: 10

@@ -1,41 +1,5 @@
 #!/usr/bin/env python3
-"""
-vision_test.py -- camera + detection only. NOTHING is sent to the flight
-controller and the drone never arms.
-
-This is the bench/handheld version of the clump_declump vision stack: run it on
-two Horus drones, carry them around by hand, point them at each other, and walk
-them apart. Afterwards you have exactly the same log directory a real flight
-produces, so the same analyzer explains what the detector did:
-
-    python3 vision_test.py                    # until Ctrl-C
-    python3 vision_test.py -d 120             # stop after 2 minutes
-
-When the run ends it builds `analysis/annotated.mp4` inside the log directory:
-the footage with the detection mask, the blob box and the reason each frame
-failed drawn onto it. Copy that off the drone and watch it. Pass --no-annotate
-to skip, and run analysis/analyze_flight.py later on a faster machine instead.
-
-Because it never touches DroneController, this is also the safe way to test
-camera changes: no mavlink connection is opened, so nothing can arm.
-
-Why run this before re-flying
------------------------------
-It isolates the question. If detection also drops out while you are walking the
-drones around by hand -- no yaw steps, no vibration, no motor EMI -- then the
-problem is the detector or the exposure, not the flight control. If handheld
-tracking is rock solid at the same ranges, the problem is motion-related and
-the flight logs are where to look.
-
-Live console output tells you what it is doing while you walk:
-  DRONE lines carry the corner count, bearing and apparent cage span.
-  A "no target" heartbeat carries mask_raw_px, which is the tell for HSV/
-  exposure problems: a nonzero raw count with no accepted blob means the
-  target IS passing the colour threshold but is being rejected on size.
-"""
-
 import argparse
-import os
 import sys
 import time
 
@@ -44,12 +8,11 @@ from flight_logger import FlightLogger
 from post_run import annotate_run
 from system_monitor import SystemMonitor
 
-# --------------------------- TUNABLES ---------------------------
-POLL_HZ       = 10.0     # console/summary poll rate (camera runs at its own fps)
-FRESH_S       = 0.5      # same freshness rule the behavior loop uses
-PRINT_EVERY_S = 0.5      # min gap between DETECT console lines
-HEARTBEAT_S   = 2.0      # "no target" console heartbeat spacing
-# ----------------------------------------------------------------
+
+POLL_HZ       = 10.0
+FRESH_S       = 0.5
+PRINT_EVERY_S = 0.5
+HEARTBEAT_S   = 2.0
 
 
 def main():
@@ -83,7 +46,7 @@ def main():
     t_last_hb = 0.0
     r_min, r_max = None, None
     s_min, s_max = None, None
-    gaps = []                    # (start_t, duration) of every dropout
+    gaps = []
     gap_start = None
     t0 = time.monotonic()
 
@@ -103,7 +66,7 @@ def main():
             det = cam.get_detection()
             fresh = det is not None and det.age() < FRESH_S
 
-            # track dropouts the same way the behavior loop would see them
+
             if fresh and gap_start is not None:
                 gaps.append((round(gap_start - t0, 1),
                              round(now - gap_start, 2)))
@@ -147,8 +110,7 @@ def main():
         if mon:
             mon.stop()
 
-        # summary: the same numbers analyze_flight.py will report, so you know
-        # on the spot whether the run is worth analysing
+
         dur = time.monotonic() - t0
         rate = 100.0 * hit / max(seen, 1)
         long_gaps = [g for g in gaps if g[1] >= 0.5]
@@ -189,28 +151,23 @@ def main():
 
 
 def print_cluster_report(cr, log):
-    """Corner-clustering health, printed on the drone.
-
-    This is the calibration readout: it tells you whether the cage's corners
-    are being found at all, whether they are being grouped into one drone, and
-    if not, what LINK_K would have to be.
-    """
-    print("\n--- corner clustering ---")
+    print("\n--- cage detector ---")
     print(f"  corners found/frame  : avg {cr['avg_found']}, max "
           f"{cr['max_found']}")
-    print(f"  frames clustered     : {cr['clustered_pct']}%  "
-          f"(need >= {cr['min_corners']} corners to call it a drone)")
+    print(f"  frames with a cage   : {cr['clustered_pct']}%  "
+          f"(need >= {cr['min_corners']} corners, quality >= "
+          f"{cr['min_quality']})")
     if cr["per_drone"]:
         dist = "  ".join(f"{k}:{v}" for k, v in cr["per_drone"].items())
-        print(f"  corners per drone    : {dist}")
-    if "link_k_used_med" in cr:
-        print(f"  auto link ratio      : {cr['link_k_used_min']} .. "
-              f"{cr['link_k_used_med']} .. {cr['link_k_used_max']}  "
-              f"(derived per frame, nothing to set)")
+        print(f"  corners per cage     : {dist}")
+    if "quality_med" in cr:
+        print(f"  cage quality         : {cr['quality_min']} .. "
+              f"{cr['quality_med']} .. {cr['quality_max']}  "
+              f"(core saturation seed {cr['core_saturation']})")
     if "span_med" in cr:
         print(f"  cage span (px)       : {cr['span_min']} .. "
               f"{cr['span_med']} .. {cr['span_max']}")
-        # span -> metres, using the same estimator the flight script flies on
+
         try:
             from camera_controller import HFOV_DEG, PROC_RES
             from range_estimator import RangeEstimator
@@ -225,13 +182,17 @@ def print_cluster_report(cr, log):
     log.add_meta("clustering", cr)
 
     if cr["avg_found"] < 1.0:
-        print("\n  !! almost no green corners found. This is a colour/exposure "
+        print("\n  !! almost no green corners found. This is a color/exposure "
               "problem,\n     not a clustering one -- check the annotated "
               "video and HSV first.")
+    elif cr.get("quality_med", 1.0) < 0.15:
+        print("\n  !! detections are firing at very low cage quality. That is "
+              "clutter,\n     not a cage -- check the annotated video before "
+              "trusting the range.")
     elif cr["clustered_pct"] < 80:
         print(f"\n  note: {100 - cr['clustered_pct']:.0f}% of frames had no "
               f"drone. If the cage was in view for those, the corners\n"
-              f"     were probably too dim or small to pass MIN_CORNER_AREA "
+              f"     were probably too dim or small to pass min_corner_area "
               f"({cr['min_corners']} corners needed).\n"
               f"     Check the annotated video: grey circles are corners that "
               f"were found\n     but not grouped, cyan are the ones that were.")
