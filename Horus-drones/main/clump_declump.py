@@ -42,15 +42,15 @@ MIN_RANGE_M       = 2.0 * CAGE_RADIUS_M + SAFETY_GAP_M
 
 DECEL_M_S2        = 1.0
 STOP_LAG_S        = 0.3
-FORWARD_FRESH_S   = 0.3
+FORWARD_FRESH_S   = 0.6
 RANGE_RISE_RATE   = 1.5
 
 
 KP_FWD            = 0.35
 VFWD_MAX          = 0.5
-KP_YAW            = 2.0
+KP_YAW            = 0.8
 YAWRATE_MAX       = 45.0
-CENTER_TOL_DEG    = 4.0
+CENTER_TOL_DEG    = 8.0
 REACQUIRE_S       = 1.0
 
 
