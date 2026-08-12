@@ -123,7 +123,9 @@ class DroneController:
                 mavutil.mavlink.MAV_TYPE_GCS,
                 mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
             hb = self._m.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
-            if hb and hb.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+            if (hb and hb.get_srcComponent() == 1
+                    and hb.autopilot !=
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID):
                 self._m.target_system = hb.get_srcSystem()
                 self._m.target_component = hb.get_srcComponent()
                 break
