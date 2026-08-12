@@ -117,7 +117,18 @@ class DroneController:
             mavutil.mavlink.MAV_TYPE_GCS,
             mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
         print("[drone] waiting for heartbeat...")
-        self._m.wait_heartbeat(timeout=timeout)
+        _t_end = time.monotonic() + 15.0
+        while time.monotonic() < _t_end:
+            self._m.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            hb = self._m.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+            if hb and hb.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+                self._m.target_system = hb.get_srcSystem()
+                self._m.target_component = hb.get_srcComponent()
+                break
+        else:
+            raise RuntimeError("no autopilot heartbeat (only router)")
         print(f"[drone] heartbeat: sys {self._m.target_system} "
               f"comp {self._m.target_component}")
 
@@ -178,11 +189,14 @@ class DroneController:
         time.sleep(prestream_s)
 
 
-        self._set_mode(6)
-        print("[drone] offboard requested")
+        if not self._set_mode(6):
+            print("[drone] OFFBOARD REFUSED -- aborting takeoff")
+            return False
         time.sleep(arm_delay_s)
-        self._arm()
-        print("[drone] arm requested -- climbing")
+        if not self._arm():
+            print("[drone] ARM REFUSED -- check preflight in QGC")
+            return False
+        print("[drone] armed -- climbing")
 
 
         self._z_hold = z_target
@@ -238,7 +252,7 @@ class DroneController:
     def land(self):
         with self._lock:
             self._sp_mode = 'pos'
-        self._set_mode(4, 6)
+        self._set_mode(4, 6, verify=False)
         print("[drone] AUTO.LAND")
 
 
@@ -464,17 +478,37 @@ class DroneController:
         self._send_err = 0
         self._max_lag = 0.0
 
-    def _set_mode(self, main_mode, sub_mode=0):
+    def _set_mode(self, main_mode, sub_mode=0, verify=True, timeout=4.0):
         with self._lock:
             self._send(lambda: self._m.mav.command_long_send(
                 self._m.target_system, self._m.target_component,
                 mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                 main_mode, sub_mode, 0, 0, 0, 0), count=False)
+        if not verify:
+            return True
+        want = _PX4_MAIN_MODE.get(main_mode, f"main{main_mode}")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            cur = self._px4_mode
+            if cur and cur.split('.')[0] == want:
+                print(f"[drone] mode {want} confirmed")
+                return True
+            time.sleep(0.1)
+        print(f"[drone] mode {want} NOT reached (still {self._px4_mode})")
+        return False
 
-    def _arm(self):
+    def _arm(self, timeout=4.0):
         with self._lock:
             self._send(lambda: self._m.mav.command_long_send(
                 self._m.target_system, self._m.target_component,
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
                 1, 0, 0, 0, 0, 0, 0), count=False)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if self._armed:
+                print("[drone] armed confirmed")
+                return True
+            time.sleep(0.1)
+        print("[drone] still disarmed after 4 s")
+        return False
