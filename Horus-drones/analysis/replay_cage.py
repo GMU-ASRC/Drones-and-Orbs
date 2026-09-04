@@ -91,7 +91,7 @@ def main():
     parser.add_argument("video")
     parser.add_argument("--annotate", metavar="OUT.mp4")
     parser.add_argument("--mask", metavar="OUT.mp4",
-                        help="green white, everything else black")
+                        help="target color white, everything else black")
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--set", action="append", default=[],
                         metavar="NAME=VALUE",

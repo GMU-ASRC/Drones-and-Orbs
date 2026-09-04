@@ -88,8 +88,8 @@ without re-flying.
 `mask_raw_px == 0` means the color window missed the target — exposure or
 color drift. `mask_raw_px > 0` with `mask_px == 0` means the seeding threw it
 away, which is the opposite fix. Under a crop both count the crop, so read them
-against the `roi` column: zero means "nothing green where we looked", not
-"nothing green in the frame".
+against the `roi` column: zero means "nothing on-color where we looked", not
+"nothing on-color in the frame".
 
 `best_area` alongside `accepted` distinguishes "saw nothing" from "saw it and
 rejected it".

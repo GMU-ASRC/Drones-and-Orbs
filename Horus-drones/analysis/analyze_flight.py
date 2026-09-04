@@ -13,7 +13,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "main"))
-from cage_detector import CageDetector, CageParams
+from cage_detector import (CageDetector, CageParams, HUE_MAX,
+                           hue_inside, hue_wraps)
 
 
 DROPOUT_S = 0.5
@@ -26,6 +27,7 @@ S_FLOOR = 25
 V_FLOOR = 25
 BLOWN_V = 235
 MIN_COLOURED_FRAC = 0.05
+HUE_WHEEL = HUE_MAX + 1
 
 
 def load_json(path, default=None):
@@ -243,7 +245,7 @@ def diagnose(res, det_cfg, last_bbox, shape):
         detail = (f"colored {100 * st['frac']:.0f}% of ROI, median "
                   f"HSV=({hm:.0f},{sm:.0f},{vm:.0f}) p90 S={hi_s:.0f} "
                   f"V={hi_v:.0f} vs lower=({lower[0]},{lower[1]},{lower[2]})")
-        if lower[0] <= hm <= upper[0]:
+        if hue_inside(hm, int(lower[0]), int(upper[0])):
             if hi_s < lower[1]:
                 return "HSV_MISS_SAT_LOW", detail
             if hi_v < lower[2]:
@@ -289,16 +291,43 @@ def find_dropouts(samples):
     return gaps
 
 
+def hue_centre(hue_low, hue_high):
+    if hue_wraps(hue_low, hue_high):
+        return ((hue_low + hue_high + HUE_WHEEL) / 2.0) % HUE_WHEEL
+    return (hue_low + hue_high) / 2.0
+
+
+def turn_hue(hue, shift):
+    return (hue + shift) % HUE_WHEEL
+
+
+def turned_percentiles(pixels, shift, cuts):
+    turned = pixels.astype(np.int32).copy()
+    turned[:, 0] = turn_hue(turned[:, 0], shift)
+    return np.percentile(turned, cuts, axis=0)
+
+
+def inside_window(pixels, low, high):
+    return (hue_inside(pixels[:, 0], low[0], high[0])
+            & (pixels[:, 1] >= low[1]) & (pixels[:, 1] <= high[1])
+            & (pixels[:, 2] >= low[2]) & (pixels[:, 2] <= high[2]))
+
+
 def recommend_hsv(pixels, missed, cfg):
     if pixels is None or len(pixels) < 500:
         return None
-    p = np.percentile(pixels, [1, 2, 50, 98, 99], axis=0)
-    lo = [int(max(0, p[1][0] - 3)), int(max(0, p[1][1] - 10)),
+    low = [int(v) for v in cfg["hsv_lower"]]
+    high = [int(v) for v in cfg["hsv_upper"]]
+
+
+    shift = int(round(HUE_WHEEL / 2.0 - hue_centre(low[0], high[0])))
+    p = turned_percentiles(pixels, shift, [1, 2, 50, 98, 99])
+    lo = [int(turn_hue(p[1][0] - 3, -shift)), int(max(0, p[1][1] - 10)),
           int(max(0, p[1][2] - 10))]
-    hi = [int(min(179, p[3][0] + 3)), 255, 255]
-    cur_lo = np.array(cfg["hsv_lower"])
-    inside = np.all((pixels >= cur_lo) & (pixels <= np.array(cfg["hsv_upper"])),
-                    axis=1)
+    hi = [int(turn_hue(p[3][0] + 3, -shift)), 255, 255]
+    for row in p:
+        row[0] = turn_hue(row[0], -shift)
+    inside = inside_window(pixels, low, high)
     out = {
         "n": len(pixels),
         "median": p[2].astype(int).tolist(),
@@ -308,17 +337,23 @@ def recommend_hsv(pixels, missed, cfg):
         "captured_pct": round(100.0 * float(inside.mean()), 1),
     }
     if missed is not None and len(missed) >= 200:
-        q = np.percentile(missed, [5, 50, 95], axis=0)
+        q = turned_percentiles(missed, shift, [5, 50, 95])
+        turned_lo = turn_hue(lo[0], shift)
+        turned_hi = turn_hue(hi[0], shift)
+        widened_lo_hue = min(turned_lo, q[0][0] - 3)
+        widened_hi_hue = max(turned_hi, q[2][0] + 3)
+        for row in q:
+            row[0] = turn_hue(row[0], -shift)
         out["missed_n"] = len(missed)
         out["missed_median"] = q[1].astype(int).tolist()
 
 
         out["widened_lower"] = [
-            int(max(0, min(lo[0], q[0][0] - 3))),
+            int(turn_hue(widened_lo_hue, -shift)),
             int(max(0, min(lo[1], q[0][1] - 5))),
             int(max(0, min(lo[2], q[0][2] - 5))),
         ]
-        out["widened_upper"] = [int(min(179, max(hi[0], q[2][0] + 3))), 255, 255]
+        out["widened_upper"] = [int(turn_hue(widened_hi_hue, -shift)), 255, 255]
     return out
 
 
@@ -339,7 +374,10 @@ def write_report(path, session, cfg, samples, gaps, hsv_rec, logs, meta, align_m
     a(f"- session start: {meta.get('t0_wall_iso', '?')}, "
       f"duration {meta.get('duration_s', '?')}s")
     a(f"- video/log alignment: **{align_mode}**")
-    a(f"- detector: HSV {cfg['hsv_lower']}..{cfg['hsv_upper']}, "
+    wrap = (" (hue wraps through 0)"
+            if hue_wraps(int(cfg["hsv_lower"][0]), int(cfg["hsv_upper"][0]))
+            else "")
+    a(f"- detector: HSV {cfg['hsv_lower']}..{cfg['hsv_upper']}{wrap}, "
       f"MIN_AREA {cfg['min_area']}, open {cfg['open_k']} close {cfg['close_k']}\n")
 
     a("## Detection summary\n")
@@ -605,8 +643,10 @@ def analyze_session(session, hsv=None, min_area=None, write_video=True,
 
     meta = load_json(os.path.join(session, "session.json"))
     cfg = dict(meta.get("camera", {}))
-    cfg.setdefault("hsv_lower", [35, 60, 40])
-    cfg.setdefault("hsv_upper", [85, 255, 255])
+    defaults = CageParams()
+    cfg.setdefault("hsv_lower", [defaults.hue_low, defaults.saturation_low,
+                                 defaults.value_low])
+    cfg.setdefault("hsv_upper", [defaults.hue_high, 255, 255])
     cfg.setdefault("min_area", 150)
     cfg.setdefault("open_k", 3)
     cfg.setdefault("close_k", 21)
@@ -821,7 +861,7 @@ def annotate(frame, res, s, cfg):
         cv2.rectangle(vis, (x, y), (x + w, y + h), col, 2)
     if res["centroid"] and res["accepted"]:
         cv2.circle(vis, (int(res["centroid"][0]), int(res["centroid"][1])),
-                   5, (0, 0, 255), -1)
+                   5, (255, 255, 255), -1)
 
     fh, fw = vis.shape[:2]
     cv2.line(vis, (fw // 2, fh // 2 - 10), (fw // 2, fh // 2 + 10),

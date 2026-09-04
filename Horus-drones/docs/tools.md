@@ -17,7 +17,7 @@ python3 analysis/replay_cage.py logs/SESSION/video.mp4 \
 carrying corner count, span, range and quality. `weak` in the HUD marks a frame
 carried by the fallback mask.
 
-`--mask` writes the color decision alone — green white, everything else black,
+`--mask` writes the color decision alone — target color white, everything else black,
 no morphology and nothing drawn over it. This answers the question underneath
 every missed frame: was the target still there to be found? A cage the color
 threshold has dropped looks identical to a lost cage in the annotated video and
@@ -61,7 +61,7 @@ data.
 | `TOO_FEW_CORNERS` | fewer than `min_corners_per_cage` | lower `min_corner_area` or `min_area_fraction` |
 | `CLUSTER_TOO_SMALL` | grouped, too little total area | lower `min_cluster_area` |
 | `QUALITY_TOO_LOW` | groups formed, none cage-shaped enough, or all beyond `max_range_m` | lower `min_quality`, raise `max_range_m` |
-| `BELOW_MIN_CORNER_AREA` | green survives the mask, no corner-sized blob | lower `min_corner_area` |
+| `BELOW_MIN_CORNER_AREA` | target color survives the mask, no corner-sized blob | lower `min_corner_area` |
 | `HSV_MISS_SAT_LOW` | target there but washed out | lower `saturation_low`, or fix auto-exposure |
 | `HSV_MISS_TOO_DARK` | below the value floor | lower `value_low`, or raise exposure |
 | `HSV_MISS_BLOWN_OUT` | over-exposed to white, no hue left | cap exposure, not the thresholds |

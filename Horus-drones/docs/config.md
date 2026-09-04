@@ -19,15 +19,19 @@ configuration a recording was made with.
 
 | field | default | meaning |
 |---|---:|---|
-| `hue_low`, `hue_high` | 33, 90 | green window in OpenCV hue (0-179) |
-| `saturation_low` | 15 | loose floor; deliberately permissive, geometry filters later |
-| `value_low` | 15 | loose floor |
-| `core_saturation` | 80 | the seed. A component survives only if it contains a pixel this saturated |
-| `core_value` | 40 | seed value floor |
+| `hue_low`, `hue_high` | 172, 18 | window in OpenCV hue (0-179) around `#c74026` (hue 5). `hue_low > hue_high` means it wraps through 0 |
+| `saturation_low` | 60 | loose floor; permissive, geometry filters later |
+| `value_low` | 30 | loose floor |
+| `core_saturation` | 120 | the seed. A component survives only if it contains a pixel this saturated |
+| `core_value` | 60 | seed value floor |
 | `fallback_frames` | 5 | how long after a confident sighting the loose mask is accepted |
 
 Raising `core_saturation` tightens precision and costs recall on a distant cage.
 Setting it at or below `saturation_low` disables hysteresis entirely.
+
+A window that wraps is normal for a red target and is handled everywhere the
+window is used. Give `hue_low` a value above `hue_high` to wrap; keep
+`hue_low <= hue_high` for any target that does not sit on the seam.
 
 ### morphology
 

@@ -2,12 +2,12 @@
 import cv2
 import numpy as np
 
-CRIMSON = (60, 20, 220)
+CYAN = (255, 255, 0)
 GREY = (150, 150, 150)
 DIM = (90, 90, 90)
 
 
-def draw_cage(view, cage, color=CRIMSON):
+def draw_cage(view, cage, color=CYAN):
     left, top, width, height = cage.box
     pad = 6
     cv2.rectangle(view, (left - pad, top - pad),
@@ -47,7 +47,7 @@ def annotate(bgr, cage, corners, index, fps, roi=None):
             f"{cage.corners_found} corners  span {cage.span_px:.0f}px  "
             f"range {cage.range_m:.1f}m  q {cage.score:.2f}"
             f"{'  weak' if cage.from_fallback else ''}")
-    caption(view, text, CRIMSON)
+    caption(view, text, CYAN)
     return view
 
 

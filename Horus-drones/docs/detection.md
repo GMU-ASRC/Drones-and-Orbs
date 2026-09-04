@@ -5,8 +5,9 @@
 Color proposes candidates; geometry decides which of them is a drone.
 
 Color on its own cannot do the job, and this was measured rather than assumed.
-On `flight2_20260805_155954`, splitting green blobs into those on the real cage
-and those on foliage, walls and window glare:
+On `flight2_20260805_155954`, back when the markers were green, splitting the
+matching blobs into those on the real cage and those on foliage, walls and
+window glare:
 
 | | saturation (median) | value (median) | area (median) |
 |---|---:|---:|---:|
@@ -24,7 +25,7 @@ blobs at similar spacings wrapping a body.
 ## Pipeline
 
 ```
-hsv -> green_window -> [morphology] -> connectedComponentsWithStats
+hsv -> color_window -> [morphology] -> connectedComponentsWithStats
                                             |
                                      seeded by core pixels   (hysteresis)
                                             |
@@ -39,24 +40,40 @@ hsv -> green_window -> [morphology] -> connectedComponentsWithStats
                                      continuity + rank -> Cage
 ```
 
+## The window wraps
+
+The markers are `#c74026`, which sits at hue 5 of 179 in OpenCV. A window wide
+enough to survive changing light runs off the bottom of the scale and back in at
+the top, so `hue_low` (172) is *greater* than `hue_high` (18). `color_window`
+detects that and takes the union of `hue_low..179` and `0..hue_high`; when
+`hue_low <= hue_high` it stays a single `inRange` call. `hue_inside` is the same
+test for one hue value and is what the analyzer uses to classify a miss.
+
+Red also costs precision that green did not: skin, brick, wood and warm shadow
+all land near hue 5 once saturation is allowed low. The loose floors are
+correspondingly higher than the green window's were — `saturation_low` 60 rather
+than 15 — and the geometry stage carries proportionally more of the work.
+
 ## Hysteresis on color
 
 A marker is a bright saturated core with a dim fringe where it fades into the
 background or into compression mush. Thresholding strictly keeps the core and
 loses the fringe, so the marker shrinks or breaks up. Thresholding loosely
-recovers the fringe and admits every washed-out green thing in the room.
+recovers the fringe and admits every washed-out warm thing in the room.
 
 Neither threshold alone can win, because the fringe of a real marker and a patch
 of noise are *the same color*. What differs is that only one of them is attached
-to something convincingly green.
+to something convincingly on-target.
 
 So the mask seeds on `core_saturation` and keeps only the loose components that
 contain a seed. This is the rule Canny uses for weak edges.
 
-Measured over four bench frames, splitting blobs by whether they fell inside the
-cage: markers ran to a 75th-percentile saturation of 104, everything else to 22.
-Seeding at 80 keeps the markers and drops most of the rest; growing back out to
-15 restores their true size.
+Measured over four bench frames of the green markers, splitting blobs by whether
+they fell inside the cage: markers ran to a 75th-percentile saturation of 104,
+everything else to 22. Seeding at 80 kept the markers and dropped most of the
+rest; growing back out to 15 restored their true size. The `#c74026` floors keep
+that shape — seed well above the loose floor — at the higher numbers red needs,
+but have not been re-measured on a recording.
 
 Effect on the bench recording: cage fragmentation fell from 18.7% of detected
 frames to 1.9%, and the median centroid step from 33 px to 24 px.
@@ -160,7 +177,7 @@ frame 247 detected.
 
 ## Corner size
 
-`min_area_fraction` rejects corners far smaller than the frame's median green
+`min_area_fraction` rejects corners far smaller than the frame's median
 blob. A **fixed** pixel floor cannot do this job, because blob size is a
 statement about range: the same markers image at a median of 248 px on bench and
 48 px on flight2, where the clutter also medians at 52 px.

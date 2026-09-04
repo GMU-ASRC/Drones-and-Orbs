@@ -182,7 +182,7 @@ def print_cluster_report(cr, log):
     log.add_meta("clustering", cr)
 
     if cr["avg_found"] < 1.0:
-        print("\n  !! almost no green corners found. This is a color/exposure "
+        print("\n  !! almost no target corners found. This is a color/exposure "
               "problem,\n     not a clustering one -- check the annotated "
               "video and HSV first.")
     elif cr.get("quality_med", 1.0) < 0.15:

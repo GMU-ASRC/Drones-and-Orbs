@@ -2,21 +2,23 @@ provenance:
   tuned_from: [bench_20260805_151709, flight2_20260805_155954]
   tuned_on: 2026-08-06
   tuned_by: analysis/replay_cage.py
+  retargeted_on: 2026-09-04
   note: >
     Field names match cage_detector.CageParams exactly; anything not listed
     here keeps the dataclass default. Section names are cosmetic.
-    Measured on bench: 94.5% of frames, cage held whole on 96.7% of those,
-    24 px median centroid step. On flight2 the cage is far enough that its
-    markers fall under the core seed and the loose fallback carries it; the
-    detector is weaker there and the annotated video shows it.
+    Everything outside the color section still comes from the 2026-08-06
+    tuning run: bench held 94.5% of frames with the cage whole on 96.7% of
+    those and a 24 px median centroid step. The color section was retargeted
+    from the old green markers to #c74026 and has not been re-measured on a
+    recording yet.
 
 color:
-  hue_low: 33
-  hue_high: 90
-  saturation_low: 15
-  value_low: 15
-  core_saturation: 80
-  core_value: 40
+  hue_low: 172
+  hue_high: 18
+  saturation_low: 60
+  value_low: 30
+  core_saturation: 120
+  core_value: 60
   fallback_frames: 5
 
 morphology:

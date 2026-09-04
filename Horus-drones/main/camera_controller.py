@@ -23,8 +23,8 @@ CAPTURE_FPS = 10
 HFOV_DEG   = 24.3
 VFOV_DEG   = 19.0
 
-HSV_LOWER  = np.array([33, 15, 15])
-HSV_UPPER  = np.array([90, 255, 255])
+HSV_LOWER  = np.array([172, 60, 30])
+HSV_UPPER  = np.array([18, 255, 255])
 
 
 RECORD_VIDEO    = True

@@ -10,14 +10,18 @@ CAGE_WIDTH_M = 0.4572
 SPAN_RANGE_CONSTANT = FOCAL_PX * CAGE_WIDTH_M
 
 
+TARGET_HEX = "#c74026"
+HUE_MAX = 179
+
+
 @dataclass
 class CageParams:
-    hue_low: int = 33
-    hue_high: int = 90
-    saturation_low: int = 15
-    value_low: int = 15
-    core_saturation: int = 80
-    core_value: int = 40
+    hue_low: int = 172
+    hue_high: int = 18
+    saturation_low: int = 60
+    value_low: int = 30
+    core_saturation: int = 120
+    core_value: int = 60
     fallback_frames: int = 5
 
     open_kernel: int = 1
@@ -88,11 +92,30 @@ def range_from_span(span):
     return SPAN_RANGE_CONSTANT / span if span > 0 else float("inf")
 
 
-def green_window(hsv, params, saturation, value):
-    return cv2.inRange(
-        hsv,
-        np.array((params.hue_low, saturation, value), dtype=np.uint8),
-        np.array((params.hue_high, 255, 255), dtype=np.uint8))
+def hue_wraps(hue_low, hue_high):
+    return hue_low > hue_high
+
+
+def hue_inside(hue, hue_low, hue_high):
+    if hue_wraps(hue_low, hue_high):
+        return (hue >= hue_low) | (hue <= hue_high)
+    return (hue >= hue_low) & (hue <= hue_high)
+
+
+def color_window(hsv, params, saturation, value):
+    low = params.hue_low
+    high = params.hue_high
+    if not hue_wraps(low, high):
+        return cv2.inRange(hsv,
+                           np.array((low, saturation, value), dtype=np.uint8),
+                           np.array((high, 255, 255), dtype=np.uint8))
+    top = cv2.inRange(hsv,
+                      np.array((low, saturation, value), dtype=np.uint8),
+                      np.array((HUE_MAX, 255, 255), dtype=np.uint8))
+    bottom = cv2.inRange(hsv,
+                         np.array((0, saturation, value), dtype=np.uint8),
+                         np.array((high, 255, 255), dtype=np.uint8))
+    return cv2.bitwise_or(top, bottom)
 
 
 _KERNELS = {}
@@ -106,7 +129,8 @@ def _kernel(size):
 
 
 def scan(hsv, params, stats=None):
-    loose = green_window(hsv, params, params.saturation_low, params.value_low)
+    loose = color_window(hsv, params, params.saturation_low,
+                         params.value_low)
     if params.open_kernel > 1:
         loose = cv2.morphologyEx(loose, cv2.MORPH_OPEN,
                                  _kernel(params.open_kernel))
@@ -118,7 +142,7 @@ def scan(hsv, params, stats=None):
     seeded = np.zeros(count, dtype=bool)
     if count > 1:
         if params.core_saturation > params.saturation_low:
-            core = green_window(hsv, params, params.core_saturation,
+            core = color_window(hsv, params, params.core_saturation,
                                 params.core_value)
             seeded[labels[core > 0]] = True
         else:
