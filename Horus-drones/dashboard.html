@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Horus Ground Station</title>
+  <style>
+    :root {
+      --bg:#0a0c0f; --surface:#111418; --surface2:#161b22;
+      --border:#1e2530; --accent:#00e5ff; --warn:#ff4444;
+      --ok:#00e676; --yellow:#ffb300; --muted:#4a5568;
+      --text:#e2e8f0; --sub:#718096;
+      --mono:'JetBrains Mono','Fira Mono',monospace;
+      --ui:'Inter',system-ui,sans-serif;
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--text);font-family:var(--ui);padding:20px 24px;min-height:100vh}
+
+    header{display:flex;align-items:center;gap:12px;margin-bottom:22px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+    .logo{width:32px;height:32px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:16px;color:#000;font-weight:700}
+    header h1{font-size:15px;font-weight:600;letter-spacing:.07em;text-transform:uppercase}
+    .ticker{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--sub)}
+    #tick{color:var(--ok)}
+
+    .panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:16px}
+    .panel-label{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--sub);margin-bottom:10px}
+
+    #swarm-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    #swarm-bar .panel-label{margin:0;margin-right:4px}
+    .swarm-right{margin-left:auto;display:flex;align-items:center;gap:7px}
+
+    .beh-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    #beh-status{font-family:var(--mono);font-size:11px;color:var(--sub);margin-top:8px}
+    #beh-status.running{color:var(--ok)}
+    #beh-status.error{color:var(--warn)}
+    #beh-output{
+      margin-top:10px;background:var(--surface2);border:1px solid var(--border);
+      border-radius:6px;padding:10px;font-family:var(--mono);font-size:11px;
+      color:#a0aec0;max-height:120px;overflow-y:auto;display:none;
+      white-space:pre-wrap;word-break:break-all;
+    }
+    #beh-output.visible{display:block}
+
+    #drones{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+    .card.armed{border-color:var(--warn)}
+    .card-header{display:flex;align-items:center;gap:10px;padding:12px 15px;border-bottom:1px solid var(--border)}
+    .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
+    .dot.online{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+    .dot.armed{background:var(--warn);box-shadow:0 0 6px var(--warn);animation:pulse 1s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+    .card-name{font-weight:600;font-size:13px;letter-spacing:.07em;text-transform:uppercase}
+    .mode-badge{margin-left:auto;font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:4px;background:#1a2030;color:var(--accent);border:1px solid #1e3040}
+
+    .telem{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);border-bottom:1px solid var(--border)}
+    .att-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--border);border-bottom:1px solid var(--border)}
+    .tc{background:var(--surface);padding:10px 13px}
+    .tl{font-size:10px;color:var(--sub);text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px}
+    .tv{font-family:var(--mono);font-size:13px}
+    .tv.hi{color:var(--accent)}
+    .bat-bar{height:3px;background:var(--border);border-radius:2px;margin-top:5px;overflow:hidden}
+    .bat-fill{height:100%;border-radius:2px;transition:width .5s,background .5s}
+
+    .cmds{padding:12px 14px;display:flex;flex-direction:column;gap:9px}
+    .cmd-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+    .cmd-lbl{font-size:10px;color:var(--sub);text-transform:uppercase;letter-spacing:.07em;width:52px;flex-shrink:0}
+
+    input[type=number],select{
+      background:var(--surface2);border:1px solid var(--border);border-radius:5px;
+      color:var(--text);font-family:var(--mono);font-size:12px;padding:5px 7px;outline:none;
+    }
+    input[type=number]{width:62px}
+    input[type=number]:focus,select:focus{border-color:var(--accent)}
+    select{cursor:pointer}
+    input:disabled,select:disabled{opacity:.3;cursor:not-allowed;pointer-events:none}
+
+    button{
+      font-family:var(--ui);font-size:11px;font-weight:600;
+      padding:6px 11px;border-radius:5px;border:1px solid transparent;
+      cursor:pointer;letter-spacing:.04em;transition:opacity .15s,transform .1s;white-space:nowrap
+    }
+    button:active{transform:scale(.97)}
+    button:disabled{opacity:.3;cursor:not-allowed;transform:none}
+    .b-arm  {background:#1a2a1a;border-color:var(--ok);   color:var(--ok)}
+    .b-dis  {background:#2a1a1a;border-color:var(--warn);  color:var(--warn)}
+    .b-land {background:#1a1a2a;border-color:var(--accent);color:var(--accent)}
+    .b-stop {background:#3a0a0a;border-color:var(--warn);  color:var(--warn);font-weight:700}
+    .b-up   {background:#1a2020;border-color:var(--accent);color:var(--accent)}
+    .b-goto {background:#1a2030;border-color:var(--accent);color:var(--accent)}
+    .b-mode {background:#1a1a2a;border-color:var(--muted); color:var(--text)}
+    .b-beh  {background:#1a2a1a;border-color:var(--ok);   color:var(--ok)}
+    .b-bstop{background:#2a1a1a;border-color:var(--warn);  color:var(--warn)}
+    .b-sw   {background:#202010;border-color:var(--yellow);color:var(--yellow)}
+    .b-swstop{background:#3a0a0a;border-color:var(--warn); color:var(--warn);font-weight:700}
+    .b-ref  {background:none;border-color:var(--border);color:var(--sub);font-size:10px}
+
+    .empty{grid-column:1/-1;text-align:center;padding:60px;color:var(--sub);font-size:13px}
+
+    #toast{
+      position:fixed;bottom:20px;right:20px;
+      background:#1a2530;border:1px solid var(--accent);color:var(--accent);
+      font-family:var(--mono);font-size:12px;padding:9px 14px;border-radius:8px;
+      opacity:0;transition:opacity .3s;pointer-events:none;z-index:999
+    }
+    #toast.show{opacity:1}
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">⬡</div>
+  <h1>Horus Ground Station</h1>
+  <div class="ticker">updated <span id="tick">—</span></div>
+</header>
+
+<!-- swarm bar -->
+<div class="panel">
+  <div id="swarm-bar">
+    <span class="panel-label">⬡ All Drones</span>
+    <button class="b-sw"     id="sw-arm"     onclick="swarmCmd('arm')"    disabled>ARM ALL</button>
+    <button class="b-sw"     id="sw-disarm"  onclick="swarmCmd('disarm')" disabled>DISARM ALL</button>
+    <button class="b-sw"     id="sw-land"    onclick="swarmCmd('land')"   disabled>LAND ALL</button>
+    <button class="b-swstop" id="sw-estop"   onclick="swarmEstop()"       disabled>⚠ E-STOP ALL</button>
+    <div class="swarm-right">
+      <span style="font-size:11px;color:var(--sub)">alt</span>
+      <input type="number" id="swarm-alt" value="1.0" min="0.5" max="10" step="0.5" style="width:58px" disabled>
+      <span style="font-size:11px;color:var(--sub)">m</span>
+      <button class="b-sw" id="sw-takeoff" onclick="swarmTakeoff()" disabled>TAKEOFF ALL</button>
+    </div>
+  </div>
+</div>
+
+<!-- behavior panel -->
+<div class="panel">
+  <div class="panel-label">⬡ Run Behavior (from Pi)</div>
+  <div class="beh-row">
+    <select id="beh-drone" onchange="onDroneChange()" disabled>
+      <option value="">— drone —</option>
+      <option value="__all__">ALL DRONES</option>
+    </select>
+    <select id="beh-script" disabled>
+      <option value="">— script —</option>
+    </select>
+    <button class="b-ref"   id="beh-refresh" onclick="refreshBehaviors()" disabled>↻</button>
+    <button class="b-beh"   id="beh-run"     onclick="runBehavior()"      disabled>RUN</button>
+    <button class="b-bstop" id="beh-stop"    onclick="stopBehavior()"     disabled>STOP</button>
+  </div>
+  <div id="beh-status">idle</div>
+  <div id="beh-output"></div>
+</div>
+
+<!-- drone cards -->
+<div id="drones"></div>
+<div id="toast"></div>
+
+<script>
+  const fmt = (v,d=2) => (v===null||v===undefined)?'—':Number(v).toFixed(d);
+  const batColor = p => p===null?'#4a5568':p>50?'#00e676':p>20?'#ffb300':'#ff4444';
+
+  let toastTimer;
+  function toast(msg, err=false) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.style.borderColor = err?'#ff4444':'#00e5ff';
+    el.style.color       = err?'#ff4444':'#00e5ff';
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>el.classList.remove('show'), 2500);
+  }
+
+  async function post(url, body={}) {
+    try {
+      const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const d = await r.json();
+      if (d.ok===false) toast('✗ '+(d.error||'error'),true);
+      else toast('✓ '+url.split('/').slice(-2).join(' → '));
+      return d;
+    } catch(e){ toast('✗ network error',true); }
+  }
+
+  // ── per-drone commands ─────────────────────────────
+  const arm    = d => post(`/command/${d}/arm`).then(r=>{ if(r&&!r.ok) toast('✗ '+r.error,true); });
+  const disarm = d => post(`/command/${d}/disarm`).then(r=>{ if(r&&!r.ok) toast('✗ '+r.error,true); });
+  const land   = d => post(`/command/${d}/land`);
+  const estop  = d => { if(confirm(`Force-kill motors on ${d}?`)) post(`/command/${d}/estop`); };
+
+  function takeoff(drone) {
+    const alt = parseFloat(document.getElementById(`alt-${drone}`).value)||1.0;
+    post(`/command/${drone}/takeoff`,{altitude:alt});
+  }
+  function goto(drone) {
+    const x = parseFloat(document.getElementById(`gx-${drone}`).value)||0;
+    const y = parseFloat(document.getElementById(`gy-${drone}`).value)||0;
+    const z = parseFloat(document.getElementById(`gz-${drone}`).value)||1;
+    post(`/command/${drone}/goto`,{x,y,z});
+  }
+  function setMode(drone) {
+    const mode = document.getElementById(`mode-${drone}`).value;
+    if (!mode) return;
+    post(`/command/${drone}/mode`,{mode});
+  }
+
+  // ── swarm commands ─────────────────────────────────
+  function swarmCmd(cmd) { post(`/swarm/${cmd}`); }
+  function swarmEstop()  { if(confirm('Force-kill motors on ALL drones?')) post('/swarm/estop'); }
+  function swarmTakeoff() {
+    const alt = parseFloat(document.getElementById('swarm-alt').value)||1.0;
+    post('/swarm/takeoff',{altitude:alt});
+  }
+
+  // ── behaviors ──────────────────────────────────────
+  let lastState = {};
+
+  function onDroneChange() {
+    const drone  = document.getElementById('beh-drone').value;
+    const select = document.getElementById('beh-script');
+    select.innerHTML = '<option value="">— script —</option>';
+    if (!drone) return;
+
+    let scripts = [];
+    if (drone === '__all__') {
+      const connected = Object.entries(lastState).filter(([,s])=>s.connected);
+      if (!connected.length) return;
+      scripts = connected[0][1].behaviors || [];
+      for (const [,s] of connected.slice(1)) {
+        scripts = scripts.filter(f=>(s.behaviors||[]).includes(f));
+      }
+    } else {
+      scripts = lastState[drone]?.behaviors || [];
+    }
+
+    scripts.forEach(b => {
+      const o = document.createElement('option');
+      o.value = b; o.textContent = b;
+      select.appendChild(o);
+    });
+
+    updatePanelButtons();
+  }
+
+  function refreshBehaviors() {
+    const drone = document.getElementById('beh-drone').value;
+    if (!drone) { toast('select a drone first',true); return; }
+    if (drone === '__all__') {
+      const connected = Object.keys(lastState).filter(n=>lastState[n].connected);
+      Promise.all(connected.map(n=>post(`/command/${n}/refresh_behaviors`)))
+        .then(()=>toast('↻ refreshing all...'));
+    } else {
+      post(`/command/${drone}/refresh_behaviors`).then(()=>toast('↻ refreshing...'));
+    }
+  }
+
+  function runBehavior() {
+    const drone  = document.getElementById('beh-drone').value;
+    const script = document.getElementById('beh-script').value;
+    if (!drone)  { toast('select a drone first',true);  return; }
+    if (!script) { toast('select a script first',true); return; }
+    drone === '__all__'
+      ? post('/behavior/run_all', {script})
+      : post('/behavior/run', {drone, script});
+  }
+
+  function stopBehavior() { post('/behavior/stop'); }
+
+  function updateBehaviorPanel(beh) {
+    const el  = document.getElementById('beh-status');
+    const out = document.getElementById('beh-output');
+    if (beh.error) {
+      el.textContent='✗ error: '+beh.error; el.className='error';
+    } else if (beh.running) {
+      const target = beh.drone==='__all__'?'all drones':beh.drone;
+      el.textContent=`● running: ${beh.name} on ${target}`; el.className='running';
+    } else {
+      el.textContent='idle'; el.className='';
+    }
+    if (beh.output?.length) {
+      out.classList.add('visible');
+      out.textContent=beh.output.join('\n');
+      out.scrollTop=out.scrollHeight;
+    } else {
+      out.classList.remove('visible');
+    }
+    document.getElementById('beh-stop').disabled = !beh.running;
+  }
+
+  // ── enable/disable swarm + behavior panel ──────────
+  function updatePanelButtons() {
+    const anyConnected  = Object.values(lastState).some(s=>s.connected);
+    const anyArmed      = Object.values(lastState).some(s=>s.connected && s.armed);
+    const anyDisarmed   = Object.values(lastState).some(s=>s.connected && !s.armed);
+    const droneSelected  = document.getElementById('beh-drone').value !== '';
+    const scriptSelected = document.getElementById('beh-script').value !== '';
+
+    document.getElementById('sw-arm').disabled     = !anyDisarmed;
+    document.getElementById('sw-disarm').disabled  = !anyArmed;
+    document.getElementById('sw-land').disabled    = !anyConnected;
+    document.getElementById('sw-estop').disabled   = !anyArmed;
+    document.getElementById('sw-takeoff').disabled = !anyConnected;
+    document.getElementById('swarm-alt').disabled    = !anyConnected;
+    document.getElementById('beh-drone').disabled    = !anyConnected;
+    document.getElementById('beh-script').disabled   = !anyConnected || !droneSelected;
+    document.getElementById('beh-refresh').disabled  = !anyConnected || !droneSelected;
+    document.getElementById('beh-run').disabled      = !anyConnected || !droneSelected || !scriptSelected;
+  }
+
+  // ── build card once ────────────────────────────────
+  function buildCard(name) {
+    const container = document.getElementById('drones');
+    const div = document.createElement('div');
+    div.id = `card-${name}`;
+    div.className = 'card';
+    div.innerHTML = `
+      <div class="card-header">
+        <div class="dot" id="dot-${name}"></div>
+        <span class="card-name">${name}</span>
+        <span class="mode-badge" id="badge-${name}">—</span>
+      </div>
+
+      <div class="telem">
+        <div class="tc">
+          <div class="tl">Position NED (m)</div>
+          <div class="tv hi" id="pos-${name}">— / — / —</div>
+          <div class="tl" style="margin-top:3px">x &nbsp; y &nbsp; z</div>
+        </div>
+        <div class="tc">
+          <div class="tl">Velocity (m/s)</div>
+          <div class="tv" id="vel-${name}">— / — / —</div>
+          <div class="tl" style="margin-top:3px">vx &nbsp; vy &nbsp; vz</div>
+        </div>
+      </div>
+
+      <div class="att-row">
+        <div class="tc"><div class="tl">Roll</div> <div class="tv" id="roll-${name}">—</div></div>
+        <div class="tc"><div class="tl">Pitch</div><div class="tv" id="pitch-${name}">—</div></div>
+        <div class="tc"><div class="tl">Yaw</div>  <div class="tv" id="yaw-${name}">—</div></div>
+      </div>
+
+      <div class="telem">
+        <div class="tc">
+          <div class="tl">Battery</div>
+          <div class="tv" id="bat-${name}">—</div>
+          <div class="bat-bar"><div class="bat-fill" id="batfill-${name}" style="width:0%"></div></div>
+        </div>
+        <div class="tc">
+          <div class="tl">Status</div>
+          <div class="tv" id="status-${name}" style="color:var(--muted)">OFFLINE</div>
+        </div>
+      </div>
+
+      <div class="cmds">
+        <div class="cmd-row">
+          <span class="cmd-lbl">Safety</span>
+          <button class="b-arm"  id="btn-arm-${name}"    onclick="arm('${name}')"    disabled>ARM</button>
+          <button class="b-dis"  id="btn-disarm-${name}" onclick="disarm('${name}')" disabled>DISARM</button>
+          <button class="b-land" id="btn-land-${name}"   onclick="land('${name}')"   disabled>LAND</button>
+          <button class="b-stop" id="btn-estop-${name}"  onclick="estop('${name}')"  disabled>⚠ E-STOP</button>
+        </div>
+        <div class="cmd-row">
+          <span class="cmd-lbl">Takeoff</span>
+          <input type="number" id="alt-${name}" value="1.0" min="0.5" max="10" step="0.5" disabled>
+          <span style="font-size:11px;color:var(--sub)">m</span>
+          <button class="b-up" id="btn-tkoff-${name}" onclick="takeoff('${name}')" disabled>↑ GO</button>
+        </div>
+        <div class="cmd-row">
+          <span class="cmd-lbl">Go to</span>
+          <input type="number" id="gx-${name}" value="0" step="0.1" title="x (m)" disabled>
+          <input type="number" id="gy-${name}" value="0" step="0.1" title="y (m)" disabled>
+          <input type="number" id="gz-${name}" value="1" step="0.1" title="alt (m)" disabled>
+          <button class="b-goto" id="btn-goto-${name}" onclick="goto('${name}')" disabled>GO</button>
+        </div>
+        <div class="cmd-row">
+          <span class="cmd-lbl">Mode</span>
+          <select id="mode-${name}" disabled>
+            <option value="">— set mode —</option>
+            <option value="position">POSITION</option>
+            <option value="altitude">ALTITUDE</option>
+            <option value="offboard">OFFBOARD</option>
+            <option value="land">LAND</option>
+          </select>
+          <button class="b-mode" id="btn-mode-${name}" onclick="setMode('${name}')" disabled>SET</button>
+        </div>
+      </div>`;
+    container.appendChild(div);
+  }
+
+  // ── patch telem + button states in place ───────────
+  function patchCard(name, s) {
+    const armed  = s.armed;
+    const online = s.connected;
+
+    document.getElementById(`card-${name}`).className = `card ${armed?'armed':''}`;
+
+    const dot = document.getElementById(`dot-${name}`);
+    dot.className = `dot ${armed?'armed':online?'online':''}`;
+
+    document.getElementById(`badge-${name}`).textContent  = s.flight_mode ?? '—';
+    document.getElementById(`pos-${name}`).textContent    = `${fmt(s.x)} / ${fmt(s.y)} / ${fmt(s.z)}`;
+    document.getElementById(`vel-${name}`).textContent    = `${fmt(s.vx)} / ${fmt(s.vy)} / ${fmt(s.vz)}`;
+    document.getElementById(`roll-${name}`).textContent   = `${fmt(s.roll_deg,1)}°`;
+    document.getElementById(`pitch-${name}`).textContent  = `${fmt(s.pitch_deg,1)}°`;
+    document.getElementById(`yaw-${name}`).textContent    = `${fmt(s.yaw_deg,1)}°`;
+
+    const pct  = s.battery_pct;
+    document.getElementById(`bat-${name}`).textContent    = pct!==null?pct+'%':'—';
+    const fill = document.getElementById(`batfill-${name}`);
+    fill.style.width = (pct??0)+'%';
+    fill.style.background = batColor(pct);
+
+    const st = document.getElementById(`status-${name}`);
+    st.textContent = armed?'⚠ ARMED':online?'DISARMED':'OFFLINE';
+    st.style.color = armed?'#ff4444':online?'#00e676':'#4a5568';
+
+    // buttons
+    document.getElementById(`btn-arm-${name}`).disabled    = !online || armed;
+    document.getElementById(`btn-disarm-${name}`).disabled = !online || !armed;
+    document.getElementById(`btn-land-${name}`).disabled   = !online;
+    document.getElementById(`btn-estop-${name}`).disabled  = !online;
+    document.getElementById(`btn-tkoff-${name}`).disabled  = !online;
+    document.getElementById(`btn-goto-${name}`).disabled   = !online;
+    document.getElementById(`btn-mode-${name}`).disabled   = !online;
+
+    // inputs
+    [`alt-${name}`,`gx-${name}`,`gy-${name}`,`gz-${name}`,`mode-${name}`].forEach(id=>{
+      document.getElementById(id).disabled = !online;
+    });
+  }
+
+  // ── poll loop ──────────────────────────────────────
+  let knownDrones = new Set();
+
+  async function refresh() {
+    try {
+      const [sr, br] = await Promise.all([fetch('/state'), fetch('/behavior_status')]);
+      const data = await sr.json();
+      const beh  = await br.json();
+      lastState  = data;
+
+      // build new cards for drones we haven't seen yet
+      for (const name of Object.keys(data)) {
+        if (!knownDrones.has(name)) {
+          // remove empty placeholder if present
+          const empty = document.querySelector('.empty');
+          if (empty) empty.remove();
+          buildCard(name);
+          knownDrones.add(name);
+        }
+      }
+
+      // if no drones at all, show placeholder
+      if (Object.keys(data).length === 0 && !document.querySelector('.empty')) {
+        document.getElementById('drones').innerHTML =
+          '<div class="empty">No drones registered.<br>Add entries to DRONES in ground_station.py</div>';
+      }
+
+      // patch each card
+      for (const [name, s] of Object.entries(data)) {
+        patchCard(name, s);
+      }
+
+      // update behavior drone dropdown
+      const dsel = document.getElementById('beh-drone');
+      const prev = dsel.value;
+      // keep ALL DRONES + rebuild individual options
+      while (dsel.options.length > 2) dsel.remove(2);
+      Object.keys(data).forEach(n => {
+        const o = document.createElement('option');
+        o.value = n; o.textContent = n;
+        if (n === prev) o.selected = true;
+        dsel.appendChild(o);
+      });
+      if (prev === '__all__') dsel.value = '__all__';
+      if (prev && prev !== dsel.value) onDroneChange();
+
+      updateBehaviorPanel(beh);
+      updatePanelButtons();
+      document.getElementById('tick').textContent = new Date().toLocaleTimeString();
+    } catch {
+      document.getElementById('tick').textContent = 'ERROR';
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 1000);
+</script>
+</body>
+</html>

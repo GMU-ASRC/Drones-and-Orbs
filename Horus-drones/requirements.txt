@@ -1,0 +1,4 @@
+pymavlink
+fastapi
+uvicorn
+paramiko
