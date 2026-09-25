@@ -686,6 +686,13 @@ def main():
     ap.add_argument("--export", metavar="OUT.mp4", help="write an annotated video")
     ap.add_argument("--csv", action="store_true", help="write target.csv")
     ap.add_argument("--snap", action="store_true", help="save annotated JPEGs")
+    ap.add_argument("--record", action="store_true",
+                    help="save EVERY raw frame, so the run can be replayed "
+                         "through this detector afterwards")
+    ap.add_argument("--record-every", type=int, default=L.REC_EVERY,
+                    help="record every Nth frame (default 1 = all of them)")
+    ap.add_argument("--record-format", choices=("jpg", "png"), default=L.REC_FORMAT)
+    ap.add_argument("--record-quality", type=int, default=L.REC_QUALITY)
     ap.add_argument("--out", default=None, help="output directory")
     ap.add_argument("--learn-static", type=int, default=0, metavar="N",
                     help="freeze the static-light map after N frames "
@@ -726,9 +733,25 @@ def main():
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     out_dir = args.out or os.path.join(OUT_DIR, f"target_{run_id}")
-    writing = args.csv or args.snap
+    writing = args.csv or args.snap or args.record
     if writing:
         os.makedirs(out_dir, exist_ok=True)
+
+    # Raw frames, written on a background thread by led_detect's Recorder --
+    # same format and same layout, so the result replays through either script.
+    # Frames are stored UNANNOTATED on purpose: the overlay is a rendering of
+    # one particular set of gates, and the recording is worth far more if you
+    # can re-run the filter over it with different ones.
+    rec = None
+    if args.record:
+        rec = L.Recorder(out_dir, args.record_format, args.record_quality,
+                         args.record_every)
+        rate = args.fps / max(1, args.record_every)
+        approx_kb = 30 if args.record_format == "jpg" else 240
+        print(f"Recording raw frames to {os.path.join(out_dir, 'frames')} "
+              f"-- ~{rate * approx_kb / 1024:.1f} MB/s, "
+              f"~{rate * approx_kb * 60 / 1024:.0f} MB/min. Watch the card.",
+              flush=True)
 
     csv_f = csv_w = None
     if args.csv:
@@ -775,6 +798,9 @@ def main():
                 fps = 0.9 * fps + 0.1 * (1.0 / dt)
             t_rel = now - t_start
             frames += 1
+
+            if rec is not None:
+                rec.write(frames, t_rel, frame, det.last_stats["n_kept"], thr)
 
             lk = det.lock
             locked = lk.live and lk.state in ("pair", "red")
@@ -887,6 +913,8 @@ def main():
         print("", flush=True)
     finally:
         src.close()
+        if rec is not None:
+            rec.close()
         if vw is not None:
             vw.release()
             print(f"wrote {args.export}", flush=True)
@@ -897,9 +925,14 @@ def main():
         if writing:
             with open(os.path.join(out_dir, "target.json"), "w") as f:
                 json.dump({"run_id": run_id, "source": str(args.source),
-                           "res": [w, h], "frames": frames,
+                           "name": src.name, "res": [w, h],
+                           "nominal_fps": args.fps, "frames": frames,
+                           "hfov_deg": L.HFOV_DEG, "vfov_deg": L.VFOV_DEG,
                            "gates": T.as_dict(),
                            "learn_static": args.learn_static,
+                           "recording": bool(rec),
+                           "frames_recorded": rec.count if rec else 0,
+                           "frames_dropped": rec.dropped if rec else 0,
                            "lock_pair_frames": n_pair,
                            "lock_red_frames": n_red,
                            "no_lock_frames": n_none}, f, indent=2)
@@ -915,6 +948,17 @@ def main():
         else:
             print("static-light rejection was OFF", flush=True)
         print(f"gates: {T.as_text()}", flush=True)
+        if rec is not None:
+            print(f"\nRecorded {rec.count} frames to {out_dir}", flush=True)
+            if rec.dropped:
+                print(f"  !! {rec.dropped} frames dropped -- the card could not "
+                      f"keep up. Use --record-every 2, or a lower --fps.",
+                      flush=True)
+            print(f"Watch it back with:\n"
+                  f"  python3 drone_led_detect.py --source {out_dir} "
+                  f"--export {os.path.join(out_dir, 'target.mp4')}\n"
+                  f"  python3 drone_led_detect.py --source {out_dir} --preview",
+                  flush=True)
 
 
 if __name__ == "__main__":
