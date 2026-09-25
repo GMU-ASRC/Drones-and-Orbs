@@ -1,3 +1,4 @@
 /snapshots
 /captures
 __pycache__/
+.venv/
