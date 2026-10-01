@@ -1,120 +1,135 @@
 #!/usr/bin/env python3
 """
-drone_led_detect.py -- find the TWO LEDs on the target drone, and nothing else.
+drone_led_detect.py -- find the marker LED on the target drone, and nothing else.
 
-led_detect.py answers "where are the bright points in this frame". In a real
-room that is the wrong question: the last run (captures/run_20260925_173212)
-returned 5967 blobs over 714 frames and almost all of them were the ceiling
-strip lights, a red sign along the back wall, and a charger LED on the floor.
-This script answers the question we actually need: "where is the target drone",
-defined as its RED arm LED and the WHITE flight-controller LED beside it.
+================== WHAT THIS ACTUALLY DOES, IN PLAIN ENGLISH ==================
 
-WHAT THE RECORDED RUN SAYS ABOUT THE DISTRACTORS
-------------------------------------------------
-Measured over every blob in run_20260925_173212 (min/p10/median/p90/max):
+Point a camera at a dark room and you get dozens of bright spots: ceiling
+lights, a lit sign, a charger LED on the floor, reflections. Exactly one of
+them is the drone we care about. This script's whole job is to throw away the
+other dozens and report where the drone is, as an angle off the centre of the
+camera.
 
-                        peak            area        aspect        redness
-  drone red LED    155/182/233/255  22/41/136/965  1.0/1.1/1.3/3.4   61..129
-  wall red sign     62/ 68/ 74/143   2/ 3/  9/203  1.0/1.0/1.5/3.5   46..100
-  ceiling strips    58/ 78/109/169   2/ 6/ 30/387  1.0/1.3/7.8/36    -51..41
+It runs five steps on every frame. Each step throws something away.
 
-No single number separates them, which is why the base detector cannot. Three
-cheap ones together do, and that is the whole design:
+  STEP 1 - FIND EVERY BRIGHT SPOT
+      led_detect.py does this part. It picks a brightness cut-off from the
+      frame itself (so it works in a dark room and a lit one) and finds every
+      blob above it. Typically 8-40 blobs per frame, nearly all of them junk.
 
-  1. SHAPE. A fluorescent tube is a line: median aspect 7.8, up to 36. An LED
-     is a point: aspect 1.0-1.6 even when its core is blown out to 30x30 px.
-     MAX_ASPECT alone removes most of the ceiling.
+  STEP 2 - THROW AWAY ANYTHING THAT IS NOT A POINT OF LIGHT
+      A ceiling strip light is a long thin line. An LED is a small round dot.
+      We measure how long-and-thin each blob is and bin the stretched ones.
+      This single step removes most of a typical room. We also bin blobs that
+      barely stand out from whatever is behind them.
 
-  2. COLOUR, narrowband only. The drone's red LED runs redness 61-129 with
-     warm = (G-B)/redness at 0.00-0.05: a 625 nm emitter leaks into G and B
-     equally. The warm ceiling light lands at warm 0.8-1.6. This is inherited
-     from led_detect.classify(), just gated much harder (RED_MIN_REDNESS 45 vs
-     RED_MARGIN 28), because here a false red costs us a false target.
+  STEP 3 - THROW AWAY ANYTHING THAT IS THE WRONG COLOUR
+      The drone's marker LED is PINK. Pink is unusual: it means red and blue
+      are both bright while green is dim. Nothing normal in a room does that --
+      lights, bulbs, sunlight and walls all have green sitting in the middle.
+      So "is green the dimmest channel, by a lot?" is a very reliable test.
+      (It can also look for a RED marker instead -- see MARKER below.)
 
-  3. IT MOVES. What survives 1 and 2 is the wall sign at (150,279) -- narrowband
-     red, compact, and present in 53 of 714 frames at the same pixel to within
-     1 px -- and the floor charger at (44,357), a saturated white point that
-     passes every brightness test there is. Both are furniture. StaticMap
-     learns any light that holds still and drops it. THIS is the layer that
-     does the heavy lifting on white, because a white LED and a ceiling light
-     are the same colour and there is no photometric test that separates them.
+  STEP 4 - THROW AWAY ANYTHING THAT NEVER MOVES
+      Whatever survived steps 2 and 3 might still be furniture: a pink-ish
+      sign on a wall, say. We remember where lights sit frame after frame, and
+      anything that parks in one spot for about a second gets ignored from
+      then on. The drone moves, so it never gets ignored.
 
-  4. THE PAIR. Red and white sit a fixed distance apart on the airframe, so a
-     red with a white beside it is a drone and a lone white is a light fitting.
-     Every true pair in the recorded run measured 24.5-41.9 px apart; every
-     false one -- the drone's red matched to a ceiling light -- measured
-     64-122. PAIR_MAX_PX at 60 separates them outright, and it is the gate that
-     turned 6 of 16 pair locks from wrong into none.
+  STEP 5 - DECIDE IF WE HAVE A TARGET, AND KEEP TRACK OF IT
+      Whatever is left is the drone. We keep a "lock" on it: we remember where
+      it was and roughly how fast it was moving, so a blob that appears far
+      from where the drone should be gets rejected, and a brief dropout does
+      not immediately lose the target.
 
-     A red seen with no white beside it still reports, as a RED-ONLY lock:
-     through frames 258-299 the target is far enough away that only the red
-     LED resolves, and a bearing from one LED is worth more than nothing. Pass
-     --require-pair if you only want detections where both are visible.
+WHAT YOU GET OUT
+    A lock state, and an angle. The angle is what matters for flying:
 
-Brightness on its own was the other option and it does not work: the floor
-charger peaks at 255 and the drone's red LED falls to 109 when it is far away,
-so any absolute cut that keeps the drone keeps the charger too. Brightness is
-used here only as a relative test -- MIN_CONTRAST, peak above the local
-background -- which is range-independent.
+        ang_x   how far LEFT or RIGHT of centre the drone is, in degrees
+        ang_y   how far UP or DOWN of centre the drone is, in degrees
 
-WHAT IT DOES ON run_20260925_173212
------------------------------------
-    714 frames: pair lock 10, red-only lock 102, no target 602
+    Lock states:
+        pair    marker LED and a white LED seen together (gives separation too)
+        mark    marker LED alone -- normal at distance. Still a usable bearing.
+        coast   nothing seen this frame, but the lock is still warm
+        none    no target
 
-The 112 locked frames fall into eight episodes -- 258-299, 523-530, 535,
-540-567, 598-630, 635-639, 647-657, 668-670 -- and those are exactly the
-frames in which the target is in shot. Frames 1-257, where the room is lit and
-the target is not in the field of view, produce ZERO locks: the twelve blobs
-per frame that led_detect reports there are all ceiling, sign and charger, and
-all of them are rejected. Verify it yourself with
+    NOTE FOR THE FLIGHT CONTROLLER: "coast" exists to keep a TRACK alive
+    through a brief dropout. It must NOT be used to decide "we have arrived,
+    stop". Stopping has to react to the first lost frame, because at ~9 fps
+    and 0.5 m/s the drone covers 54 mm per frame and the 8-frame coast would
+    carry it 430 mm past where you wanted to stop.
 
-    python3 drone_led_detect.py --source captures/run_20260925_173212 \
-            --export target_review.mp4
+================================ HOW TO RUN IT ================================
 
-Rejected blobs are drawn as small grey crosses tagged with the gate that
-dropped them (elongated / colour / flat / static / streak / tiny / huge), so
-the video shows what was thrown away and why, not just what survived.
+Replay a run you already recorded, and print what it found frame by frame:
 
-RUNNING IT
-----------
-Against the run you already recorded, headless:
+    python3 drone_led_detect.py --source captures/<run> --report
 
-    python3 drone_led_detect.py --source captures/run_20260925_173212 --report
-    python3 drone_led_detect.py --source captures/run_20260925_173212 \
-            --export target.mp4
+Make a video with the detections drawn on, to watch afterwards:
 
-Or replay it in a window at --fps, with the sliders live, so you can watch a
-gate take effect on a real run instead of guessing:
+    python3 drone_led_detect.py --source captures/<run> --export out.mp4
 
-    python3 drone_led_detect.py --source captures/run_20260925_173212 \
-            --preview --fps 8
+Replay it in a window, with sliders for every threshold, so you can see a
+change take effect on real footage instead of guessing:
 
-Live on the drone (use led_detect.py --record if you also want the raw frames
-kept; this script writes the target track, not the imagery):
+    python3 drone_led_detect.py --source captures/<run> --preview --fps 8
+    python3 drone_led_detect.py --source captures/<run> --tune --fps 8
 
-    python3 drone_led_detect.py --source picam --csv --snap
+Live on the drone, saving both the raw frames and the target track:
 
-With a window, and sliders for every gate below:
+    python3 drone_led_detect.py --source picam --marker pink --record --csv
 
-    python3 drone_led_detect.py --source captures/run_20260925_173212 --tune
+Useful switches:
+    --marker pink|red|both   which colour the drone's LED is set to
+    --require-pair           only report when BOTH LEDs are visible
+    --no-static              turn off step 4, to see what it was removing
+    --learn-static N         freeze step 4 after N frames (see below)
 
-STATIC REJECTION AND ITS ONE FAILURE MODE
------------------------------------------
-An anchor is called furniture once it has been hit in STATIC_MIN_HITS frames
-AND its detections keep landing within STATIC_JITTER_PX of it. A target that
-truly hovers motionless in the frame for that long looks exactly like
-furniture and will be dropped. Two outs:
+In the exported video: a YELLOW circle is the lock, coloured boxes are
+accepted LEDs, and small GREY crosses are blobs that were thrown away, each
+tagged with the step that threw it away (elongated / flat / colour / static).
+So you can always see what was rejected and why, not just what survived.
 
-  * --learn-static N freezes the map after N frames. Point the camera at the
-    room with the target out of frame, let it learn, then fly. Nothing learned
-    afterwards, so a hovering target is safe. This is the mode to use on a
-    bench test.
-  * in the default adaptive mode, an LED that is part of the current lock is
-    never allowed to become static, so once locked the target stays locked.
+========================== WHY THE THRESHOLDS ARE SET WHERE THEY ARE ==========
+(You only need this section if you are re-tuning. Every number below was
+measured, not guessed -- see colour_probe.py for how to re-measure.)
 
-Camera motion is compensated by phase correlation between frames, so the map
-survives a pan. A jump larger than MOTION_RESET_PX is treated as a cut and the
-map is cleared.
+STEP 2, SHAPE. Measured over 5967 blobs of run_20260925_173212:
+  ceiling strip lights    length/width ratio  median 7.8, up to 36
+  the drone's LED         length/width ratio  1.0 to 3.4, even blown out
+MAX_ASPECT at 3.2 splits them.
+
+STEP 3, COLOUR. "Green gap" = min(Red,Blue) - Green, read off the glow around
+the blob rather than its centre (a close LED blows its centre to pure white
+and loses all colour there; the glow keeps it). Measured over three runs,
+2052 frames, counting only blobs fully inside the frame:
+
+  room with no pink LED present      green gap tops out at   30.2
+  the real pink LED                  green gap starts at     47.1
+
+PINK_MIN_GAP sits at 38, in the middle of that empty band. The pink module is
+violet-leaning -- blue slightly ABOVE red -- so the blue/red ratio window has
+to reach past 1.0; measured 0.87 to 1.77, window is 0.55 to 2.00. The old red
+LED sat at 0.04 to 0.21, so the two colours never get confused.
+
+STEP 4, STATIC. One failure mode worth knowing: a target that hovers perfectly
+still for about a second looks exactly like furniture and gets dropped. Two
+protections -- an LED that is part of the current lock is never allowed to
+become furniture, and --learn-static N freezes the map after N frames so you
+can learn an empty room first and then fly. Camera motion is measured and the
+map is shifted to match, so it survives a pan.
+
+STEP 5, PAIRING. When both a marker and a white LED are visible, they pair
+only if they are close together. Every true pair measured 24.5-41.9 px apart;
+every false one (marker matched to a distant ceiling light) measured 64-122.
+PAIR_MAX_PX at 60 splits them.
+
+WHAT IT SCORED ON REAL FOOTAGE
+    run_20260925_173212 (red marker):  10 pair + 102 marker-only of 714 frames
+    target_20261001_234030 (pink):     331 marker-only of 823 frames
+In both, the locked frames are exactly the frames where the target is in shot,
+and the frames where it is not in shot produce ZERO false locks.
 """
 import argparse
 import csv
@@ -129,13 +144,18 @@ import numpy as np
 import led_detect as L
 
 # --------------------------- TUNABLES ---------------------------
-# --- candidate supply ---
+# --- STEP 1: how many bright spots to even consider ---
 # led_detect caps itself at 12 blobs, which in this room is 12 ceiling lights
 # and no drone. The filter needs raw material, so ask for many more and let the
 # gates below do the cutting.
 CANDIDATES = 40
 
-# --- 1. point-source gate ---
+# --- STEP 2: is this a point of light, or is it furniture? ---
+# aspect  = how long-and-thin the blob is. A ceiling tube is a line (7.8 and
+#           up), an LED is a dot (1.0 to 3.4). This is the big one.
+# fill    = how much of its bounding box the blob fills. Kills diagonal wires.
+# contrast= how far the blob's peak sits above whatever is right behind it.
+#           Relative, not absolute, so it means the same thing near and far.
 MAX_ASPECT   = 3.2      # max(w,h)/min(w,h). Ceiling tubes sit at 7.8 median.
 MIN_FILL     = 0.30     # area/(w*h). Kills diagonal cage wires and streaks.
 MIN_CONTRAST = 35       # peak minus the local background, in counts. Relative,
@@ -143,7 +163,7 @@ MIN_CONTRAST = 35       # peak minus the local background, in counts. Relative,
 MIN_AREA     = 2        # px. A distant LED really is this small.
 MAX_AREA     = 4000     # px. Above this it is a lamp, not an indicator.
 
-# --- 2. colour identification ---
+# --- STEP 3: is it the right colour? ---
 # MARKER is which colour the drone's arm LED is set to. The RGB SMD5050 strobe
 # modules do several colours off one button, so this is a per-flight setting,
 # not a property of the detector. "both" accepts either and is the safe default
@@ -154,17 +174,26 @@ RED_MIN_REDNESS = 45.0  # R - max(G,B), read off the halo when the core is blown
 RED_MAX_WARM    = 0.30  # (G-B)/redness. ~0 for an LED, ~1+ for a warm bulb.
 
 # Pink is red+blue with green off, so it is NOT a redness test -- see the long
-# note in led_detect.py. These are deliberately looser than they probably need
-# to be, because nothing else in the room produces a positive green gap at all;
-# tighten them once there is a real measurement of your module on pink.
-PINK_MIN_GAP      = 45.0   # min(R,B) - G off the halo
-PINK_MIN_BLUE_FRAC = 0.30  # B/R: below this it is just red
-PINK_MAX_BLUE_FRAC = 1.80  # B/R: above this it is violet or blue
+# note in led_detect.py, which carries the measurements these come from.
+# Measured on the real module (target_20261001_234030, 361 pink blobs):
+#   green gap  47.1 .. 113.2   (median 69.3; in-frame minimum 53.3)
+#   B/R        0.87 .. 1.77    (median 1.09; in-frame maximum 1.29)
+# The module reads violet-leaning pink -- B slightly ABOVE R -- which is why
+# the B/R window has to reach past 1.0. The old red LED sat at B/R 0.04-0.21,
+# so 0.55 separates the two colours cleanly with room on both sides.
+PINK_MIN_GAP      = 38.0   # min(R,B) - G off the halo
+PINK_MIN_BLUE_FRAC = 0.55  # B/R: below this it is just red
+PINK_MAX_BLUE_FRAC = 2.00  # B/R: above this it is violet or blue
 
 WHITE_MAX_CHROMA = 24.0 # max(BGR)-min(BGR)
 WHITE_MAX_REDNESS = 25.0
 
-# --- 3. static-light rejection ---
+# --- STEP 4: has this light been parked in one spot? ---
+# Anything that stays put for about a second is furniture and gets ignored
+# from then on. "hits" is a weight that grows while a light keeps appearing in
+# the same place and decays when it stops. "jitter" is how far its detections
+# land from the remembered spot -- furniture reads under 1 px, anything
+# actually moving reads much higher.
 STATIC_ON        = True
 STATIC_LINK_PX   = 6.0    # a detection this close to an anchor is that anchor
 STATIC_MIN_HITS  = 12     # weight needed before an anchor counts as furniture
@@ -183,7 +212,7 @@ MOTION_DEADBAND  = 0.35   # ignore sub-pixel phase-correlation noise; without
                           # frames and never settle
 MOTION_RESET_PX  = 45.0   # a jump bigger than this is a cut: clear the map
 
-# --- 4. pairing and tracking ---
+# --- STEP 5: pair the LEDs up, and hold a lock on the target ---
 PAIR_MIN_PX   = 3.0     # below this they are one blob, not two LEDs
 # Every true pair in run_20260925_173212 measured 24.5-41.9 px apart; every
 # false pair (a red LED matched to a ceiling light) measured 64-122. 60 px
@@ -468,9 +497,19 @@ def score_pair(mark, white, predicted):
 class Lock:
     """The target, once we believe in it.
 
-    States: 'pair' both LEDs this frame, 'mark' the marker LED alone (the white
-    is unresolved at range -- frames 258-299 of the recorded run look like
-    this), 'coast' nothing this frame but the lock is still warm.
+    States:
+        'pair'  both LEDs seen this frame
+        'mark'  the marker LED alone. Normal at distance, where the white LED
+                is too dim to resolve -- frames 258-299 of the recorded run
+                look like this. Still a perfectly usable bearing.
+        'coast' nothing seen this frame, but the lock is still warm and we are
+                carrying it forward on its last known velocity.
+
+    IMPORTANT for anything that flies on this: 'coast' is for keeping a TRACK
+    alive through a brief dropout. Do not use the end of the coast as a "we
+    have arrived, stop" signal. At ~9 fps and 0.5 m/s the drone covers 54 mm
+    per frame, so COAST_FRAMES of 8 is 430 mm of extra travel. A stop has to
+    react to the first lost frame.
     """
 
     def __init__(self):

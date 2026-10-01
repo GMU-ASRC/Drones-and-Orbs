@@ -134,22 +134,34 @@ WHITE_MAX_CHROMA = 22       # max(BGR) - min(BGR) at or below this => white
 # scores redness = R - max(G,B) = 75, over RED_MARGIN, and its warm term goes
 # strongly negative, which the red test does not reject -- so a pink LED reads
 # as RED unless pink is checked first.
-# 45 is set from measurement, not taste. Over all 5986 blobs of
-# run_20260925_173212 -- every ceiling tube, the red sign, the warm lamp, the
-# blue LEDs, the floor charger -- the green gap had median -9.6, p99 7.4 and a
-# MAXIMUM of 28.4, so the whole room sits below this. A synthetic hot-pink LED
-# scores 77-154, so there is a wide empty band between the two and the exact
-# value is not critical.
+# Set from measurement over three runs, 2052 frames. The green gap of every
+# blob, split by whether the blob touches the frame border:
 #
-# It must not go much lower, though, and the reason is COLOUR_GAINS below:
-# AWB is off and red and blue are boosted 1.6x over green, so a genuinely
-# NEUTRAL white source lands magenta-tinted and scores about 45 in simulation.
-# The room's real whites are warm (R>G>B) and never came close, but a cool
-# white LED pointed straight at the lens could. If you change COLOUR_GAINS,
+#                                   in-frame max   weakest real pink
+#   run_164912  (room, no pink)          30.2            --
+#   run_173212  (room, no pink)          28.4            --
+#   target_20261001 (pink present)        9.3          53.3 in-frame
+#                                                      47.1 clipped at border
+#
+# So the room tops out at 30.2 and real pink starts at 47.1. 38 sits in the
+# middle of that empty band: 7.8 above the worst room blob, 9.1 below the
+# weakest pink. It was 45 before, set from simulation alone, which left only
+# 2.1 of margin on the side that matters -- losing the target costs more than
+# an extra blob, which still has to clear the shape, static and pair gates
+# downstream.
+#
+# Careful lowering it further: the border column above is NOT a safety margin.
+# Those high-gap border blobs are the pink LED itself half out of frame, and
+# the genuine room blobs at the border only reach 19.3.
+#
+# One trap, unrelated to the LED: COLOUR_GAINS below has AWB off with red and
+# blue boosted 1.6x over green, so a genuinely NEUTRAL white source lands
+# magenta-tinted and scores about 45 in simulation. Real room whites are warm
+# (R>G>B) and measured nowhere near it, but if you change COLOUR_GAINS,
 # re-measure this.
-PINK_MIN_GREEN_GAP = 45     # min(R,B) - G at or above this => candidate pink
-PINK_MIN_BLUE_FRAC = 0.30   # B/R below this is just red, not pink
-PINK_MAX_BLUE_FRAC = 1.80   # B/R above this is violet or blue, not pink
+PINK_MIN_GREEN_GAP = 38     # min(R,B) - G at or above this => candidate pink
+PINK_MIN_BLUE_FRAC = 0.55   # B/R below this is just red, not pink
+PINK_MAX_BLUE_FRAC = 2.00   # B/R above this is violet or blue, not pink
 
 # --- exposure lock (picamera2 only; the single most important knob) ---
 LOCK_EXPOSURE = True
