@@ -144,8 +144,23 @@ MIN_AREA     = 2        # px. A distant LED really is this small.
 MAX_AREA     = 4000     # px. Above this it is a lamp, not an indicator.
 
 # --- 2. colour identification ---
+# MARKER is which colour the drone's arm LED is set to. The RGB SMD5050 strobe
+# modules do several colours off one button, so this is a per-flight setting,
+# not a property of the detector. "both" accepts either and is the safe default
+# while you are still switching the module between colours.
+MARKER = "both"         # "pink" | "red" | "both"
+
 RED_MIN_REDNESS = 45.0  # R - max(G,B), read off the halo when the core is blown
 RED_MAX_WARM    = 0.30  # (G-B)/redness. ~0 for an LED, ~1+ for a warm bulb.
+
+# Pink is red+blue with green off, so it is NOT a redness test -- see the long
+# note in led_detect.py. These are deliberately looser than they probably need
+# to be, because nothing else in the room produces a positive green gap at all;
+# tighten them once there is a real measurement of your module on pink.
+PINK_MIN_GAP      = 45.0   # min(R,B) - G off the halo
+PINK_MIN_BLUE_FRAC = 0.30  # B/R: below this it is just red
+PINK_MAX_BLUE_FRAC = 1.80  # B/R: above this it is violet or blue
+
 WHITE_MAX_CHROMA = 24.0 # max(BGR)-min(BGR)
 WHITE_MAX_REDNESS = 25.0
 
@@ -200,6 +215,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "captures")
 
 COL_RED   = (40, 40, 255)
+COL_PINK  = (180, 105, 255)     # BGR: hot pink, matching led_detect.COLOURS
 COL_WHITE = (255, 255, 255)
 COL_LOCK  = (0, 255, 255)
 COL_DROP  = (90, 90, 90)
@@ -214,8 +230,12 @@ class TargetParams:
         self.min_contrast = MIN_CONTRAST
         self.min_area = MIN_AREA
         self.max_area = MAX_AREA
+        self.marker = MARKER
         self.red_min_redness = RED_MIN_REDNESS
         self.red_max_warm = RED_MAX_WARM
+        self.pink_min_gap = PINK_MIN_GAP
+        self.pink_min_blue_frac = PINK_MIN_BLUE_FRAC
+        self.pink_max_blue_frac = PINK_MAX_BLUE_FRAC
         self.white_max_chroma = WHITE_MAX_CHROMA
         self.white_max_redness = WHITE_MAX_REDNESS
         self.static_on = STATIC_ON
@@ -225,7 +245,10 @@ class TargetParams:
     def as_text(self):
         return (f"aspect<={self.max_aspect:.1f} fill>={self.min_fill:.2f} "
                 f"contrast>={self.min_contrast} area={self.min_area}..{self.max_area} "
+                f"marker={self.marker} "
                 f"red>={self.red_min_redness:.0f}/warm<={self.red_max_warm:.2f} "
+                f"pink gap>={self.pink_min_gap:.0f}/"
+                f"b-r={self.pink_min_blue_frac:.2f}..{self.pink_max_blue_frac:.2f} "
                 f"white chroma<={self.white_max_chroma:.0f} "
                 f"pair<={self.pair_max_px:.0f}px "
                 f"static={'on' if self.static_on else 'off'}"
@@ -287,15 +310,27 @@ def point_source(led, vch, mask):
 
 
 # ========================== 2. COLOUR IDENTITY ==========================
-def identify(led):
-    """'red', 'white' or None. Deliberately stricter than led_detect.classify:
-    this stage decides what we will chase, so everything ambiguous is dropped.
+def is_marker(kind):
+    """Is this colour the drone's arm LED for the current MARKER setting?"""
+    return kind == T.marker or (T.marker == "both" and kind in ("pink", "red"))
 
-    `redness` and `warm` come out of led_detect's halo classifier, which reads
-    colour from the ring around a blown core -- without that a saturated red
-    LED reads as pure white, which is exactly what the drone's LED does at
-    close range (64-70 saturated pixels in frames 541-545).
+
+def identify(led):
+    """'pink', 'red', 'white' or None. Deliberately stricter than
+    led_detect.classify: this stage decides what we will chase, so everything
+    ambiguous is dropped.
+
+    Every number here comes out of led_detect's halo classifier, which reads
+    colour from the ring around a blown core -- without that a saturated LED
+    reads as pure white, which is exactly what the drone's LED does at close
+    range (64-70 saturated pixels in frames 541-545).
+
+    Pink is tested before red for the reason given in led_detect: hot pink
+    clears RED_MIN_REDNESS on its own, so red would otherwise swallow it.
     """
+    if (led["pinkness"] >= T.pink_min_gap
+            and T.pink_min_blue_frac <= led["blue_frac"] <= T.pink_max_blue_frac):
+        return "pink"
     if led["redness"] >= T.red_min_redness and abs(led["warm"]) <= T.red_max_warm:
         return "red"
     if (led["chroma"] <= T.white_max_chroma
@@ -415,17 +450,17 @@ class StaticMap:
 
 
 # ======================= 4. PAIRING AND TRACKING =======================
-def score_pair(red, white, predicted):
+def score_pair(mark, white, predicted):
     """Higher is better. Prefers a bright, tight pair near where the last lock
     was; the distance term is soft so a target that jumps is still found."""
-    d = math.hypot(red["cx"] - white["cx"], red["cy"] - white["cy"])
+    d = math.hypot(mark["cx"] - white["cx"], mark["cy"] - white["cy"])
     if d < PAIR_MIN_PX or d > T.pair_max_px:
         return None, d
-    light = math.log1p(red["light"]) + math.log1p(white["light"])
+    light = math.log1p(mark["light"]) + math.log1p(white["light"])
     s = light - 6.0 * math.log1p(d)
     if predicted is not None:
-        mx = 0.5 * (red["cx"] + white["cx"])
-        my = 0.5 * (red["cy"] + white["cy"])
+        mx = 0.5 * (mark["cx"] + white["cx"])
+        my = 0.5 * (mark["cy"] + white["cy"])
         s -= 0.02 * math.hypot(mx - predicted[0], my - predicted[1])
     return s, d
 
@@ -433,16 +468,16 @@ def score_pair(red, white, predicted):
 class Lock:
     """The target, once we believe in it.
 
-    States: 'pair' both LEDs this frame, 'red' the red LED alone (the white is
-    unresolved at range -- frames 258-299 of the recorded run look like this),
-    'coast' nothing this frame but the lock is still warm.
+    States: 'pair' both LEDs this frame, 'mark' the marker LED alone (the white
+    is unresolved at range -- frames 258-299 of the recorded run look like
+    this), 'coast' nothing this frame but the lock is still warm.
     """
 
     def __init__(self):
         self.state = "none"
         self.cx = self.cy = None
         self.vx = self.vy = 0.0
-        self.red = self.white = None
+        self.mark = self.white = None
         self.sep = 0.0
         self.hits = 0
         self.misses = 0
@@ -463,14 +498,14 @@ class Lock:
     def gate(self):
         return GATE_PX * (1 + self.misses)
 
-    def _accept(self, state, cx, cy, red, white, sep):
+    def _accept(self, state, cx, cy, mark, white, sep):
         if self.cx is not None:
             n = max(1, self.misses + 1)
             self.vx += 0.5 * ((cx - self.cx) / n - self.vx)
             self.vy += 0.5 * ((cy - self.cy) / n - self.vy)
         self.state = state
         self.cx, self.cy = cx, cy
-        self.red, self.white, self.sep = red, white, sep
+        self.mark, self.white, self.sep = mark, white, sep
         self.hits += 1
         self.misses = 0
         self.age += 1
@@ -483,12 +518,12 @@ class Lock:
             return
         elif self.state != "none":
             self.state = "coast"
-            self.red = self.white = None
+            self.mark = self.white = None
 
-    def update(self, reds, whites):
+    def update(self, marks, whites):
         pred = self.predicted()
         best = None
-        for r in reds:
+        for r in marks:
             for w in whites:
                 s, d = score_pair(r, w, pred)
                 if s is None:
@@ -502,18 +537,18 @@ class Lock:
                     or math.hypot(cx - pred[0], cy - pred[1]) <= self.gate():
                 self._accept("pair", cx, cy, r, w, d)
                 return
-        if reds and not REQUIRE_PAIR:
-            # No white beside it. Take the brightest red that is in the gate --
-            # at range the white LED simply is not resolvable, and a red-only
-            # lock still gives a bearing.
-            cand = reds
+        if marks and not REQUIRE_PAIR:
+            # No white beside it. Take the brightest marker that is in the gate
+            # -- at range the white LED simply is not resolvable, and a
+            # marker-only lock still gives a bearing.
+            cand = marks
             if pred is not None and self.live:
                 g = self.gate()
-                cand = [r for r in reds
+                cand = [r for r in marks
                         if math.hypot(r["cx"] - pred[0], r["cy"] - pred[1]) <= g]
             if cand:
                 r = max(cand, key=lambda d: d["light"])
-                self._accept("red", r["cx"], r["cy"], r, None, 0.0)
+                self._accept("mark", r["cx"], r["cy"], r, None, 0.0)
                 return
         self.miss()
 
@@ -575,11 +610,11 @@ class Detector:
         else:
             live = kept
 
-        reds = [d for d in live if d["kind"] == "red"]
+        marks = [d for d in live if is_marker(d["kind"])]
         whites = [d for d in live if d["kind"] == "white"]
-        self.lock.update(reds, whites)
+        self.lock.update(marks, whites)
 
-        protect = {id(x) for x in (self.lock.red, self.lock.white) if x is not None}
+        protect = {id(x) for x in (self.lock.mark, self.lock.white) if x is not None}
         self.static.update(points, protect)
 
         n_static = self.static.n_static
@@ -605,7 +640,7 @@ def annotate(frame, live, dropped, det, thr, extra="", show_dropped=True):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, COL_DROP, 1, cv2.LINE_AA)
 
     for d in live:
-        col = COL_RED if d["kind"] == "red" else COL_WHITE
+        col = {"red": COL_RED, "pink": COL_PINK}.get(d["kind"], COL_WHITE)
         p = max(7, int(d["r_px"] * 2) + 6)
         cx, cy = int(round(d["cx"])), int(round(d["cy"]))
         cv2.rectangle(vis, (cx - p, cy - p), (cx + p, cy + p), col, 1)
@@ -620,8 +655,8 @@ def annotate(frame, live, dropped, det, thr, extra="", show_dropped=True):
         r = int(max(18, lk.sep)) + 10
         cv2.circle(vis, (cx, cy), r, COL_LOCK, 2 if lk.state != "coast" else 1)
         cv2.drawMarker(vis, (cx, cy), COL_LOCK, cv2.MARKER_CROSS, 16, 1)
-        if lk.red is not None and lk.white is not None:
-            cv2.line(vis, (int(lk.red["cx"]), int(lk.red["cy"])),
+        if lk.mark is not None and lk.white is not None:
+            cv2.line(vis, (int(lk.mark["cx"]), int(lk.mark["cy"])),
                      (int(lk.white["cx"]), int(lk.white["cy"])), COL_LOCK, 1)
             cv2.putText(vis, f"{lk.sep:.1f}px",
                         (cx + r + 3, cy - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
@@ -647,6 +682,11 @@ def make_trackbars():
     cv2.createTrackbar("red_redness", TUNE_WIN, int(T.red_min_redness), 150, lambda v: None)
     cv2.createTrackbar("red_warm x100", TUNE_WIN, int(T.red_max_warm * 100), 200, lambda v: None)
     cv2.createTrackbar("white_chroma", TUNE_WIN, int(T.white_max_chroma), 128, lambda v: None)
+    cv2.createTrackbar("pink_gap", TUNE_WIN, int(T.pink_min_gap), 150, lambda v: None)
+    cv2.createTrackbar("pink_bfrac_lo x100", TUNE_WIN,
+                       int(T.pink_min_blue_frac * 100), 200, lambda v: None)
+    cv2.createTrackbar("pink_bfrac_hi x100", TUNE_WIN,
+                       int(T.pink_max_blue_frac * 100), 400, lambda v: None)
     cv2.createTrackbar("pair_max_px", TUNE_WIN, int(T.pair_max_px), 400, lambda v: None)
     cv2.createTrackbar("static on", TUNE_WIN, int(T.static_on), 1, lambda v: None)
     cv2.createTrackbar("static hits", TUNE_WIN, T.static_min_hits, 120, lambda v: None)
@@ -659,6 +699,10 @@ def read_trackbars(det):
     T.red_min_redness = float(cv2.getTrackbarPos("red_redness", TUNE_WIN))
     T.red_max_warm = cv2.getTrackbarPos("red_warm x100", TUNE_WIN) / 100.0
     T.white_max_chroma = float(cv2.getTrackbarPos("white_chroma", TUNE_WIN))
+    T.pink_min_gap = float(cv2.getTrackbarPos("pink_gap", TUNE_WIN))
+    T.pink_min_blue_frac = cv2.getTrackbarPos("pink_bfrac_lo x100", TUNE_WIN) / 100.0
+    T.pink_max_blue_frac = max(T.pink_min_blue_frac + 0.05,
+                               cv2.getTrackbarPos("pink_bfrac_hi x100", TUNE_WIN) / 100.0)
     T.pair_max_px = float(max(4, cv2.getTrackbarPos("pair_max_px", TUNE_WIN)))
     T.static_on = bool(cv2.getTrackbarPos("static on", TUNE_WIN))
     T.static_min_hits = max(1, cv2.getTrackbarPos("static hits", TUNE_WIN))
@@ -666,6 +710,14 @@ def read_trackbars(det):
 
 
 # ================================ MAIN ================================
+def mark_text(m):
+    """One compact readout for the marker LED, whichever colour it is."""
+    if m["kind"] == "pink":
+        return (f"P:pk={m['peak']:3d} gap={m['pinkness']:+5.1f} "
+                f"b/r={m['blue_frac']:4.2f}")
+    return f"R:pk={m['peak']:3d} red={m['redness']:+5.1f}"
+
+
 def bearing(cx, cy, cxi, cyi, tan_h, tan_v):
     return (math.degrees(math.atan((cx - cxi) / cxi * tan_h)),
             math.degrees(math.atan((cy - cyi) / cyi * tan_v)))
@@ -703,6 +755,8 @@ def main():
                     help=f"max red-to-white separation in px (default {PAIR_MAX_PX:g})")
     ap.add_argument("--require-pair", action="store_true",
                     help="only report a lock when BOTH LEDs are seen")
+    ap.add_argument("--marker", choices=("pink", "red", "both"), default=MARKER,
+                    help=f"colour of the drone's arm LED (default {MARKER})")
     ap.add_argument("--hide-dropped", action="store_true",
                     help="do not draw the blobs the filter rejected")
     ap.add_argument("--no-lock-exposure", action="store_true")
@@ -711,6 +765,7 @@ def main():
     if args.no_static:
         T.static_on = False
     T.pair_max_px = args.pair_max_px
+    T.marker = args.marker
     if args.require_pair:
         globals()["REQUIRE_PAIR"] = True
 
@@ -758,8 +813,9 @@ def main():
         csv_f = open(os.path.join(out_dir, "target.csv"), "w", newline="")
         csv_w = csv.writer(csv_f)
         csv_w.writerow(["frame", "t_s", "lock", "cx", "cy", "ang_x_deg",
-                        "ang_y_deg", "sep_px", "red_cx", "red_cy", "red_peak",
-                        "red_redness", "white_cx", "white_cy", "white_peak",
+                        "ang_y_deg", "sep_px", "mark_kind", "mark_cx", "mark_cy",
+                        "mark_peak", "mark_redness", "mark_pinkness",
+                        "mark_blue_frac", "white_cx", "white_cy", "white_peak",
                         "n_raw", "n_kept", "n_static", "thr"])
 
     vw = None
@@ -803,10 +859,10 @@ def main():
                 rec.write(frames, t_rel, frame, det.last_stats["n_kept"], thr)
 
             lk = det.lock
-            locked = lk.live and lk.state in ("pair", "red")
+            locked = lk.live and lk.state in ("pair", "mark")
             if lk.live and lk.state == "pair":
                 n_pair += 1
-            elif lk.live and lk.state == "red":
+            elif lk.live and lk.state == "mark":
                 n_red += 1
             else:
                 n_none += 1
@@ -816,14 +872,17 @@ def main():
                 ax, ay = bearing(lk.cx, lk.cy, cxi, cyi, tan_h, tan_v)
 
             if csv_w:
-                r, wt = lk.red, lk.white
+                r, wt = lk.mark, lk.white
                 csv_w.writerow([
                     frames, f"{t_rel:.3f}", lk.state if lk.live else "none",
                     f"{lk.cx:.2f}" if lk.cx is not None else "",
                     f"{lk.cy:.2f}" if lk.cy is not None else "",
                     f"{ax:.3f}", f"{ay:.3f}", f"{lk.sep:.2f}",
+                    r["kind"] if r else "",
                     f"{r['cx']:.2f}" if r else "", f"{r['cy']:.2f}" if r else "",
                     r["peak"] if r else "", f"{r['redness']:.1f}" if r else "",
+                    f"{r['pinkness']:.1f}" if r else "",
+                    f"{r['blue_frac']:.3f}" if r else "",
                     f"{wt['cx']:.2f}" if wt else "", f"{wt['cy']:.2f}" if wt else "",
                     wt["peak"] if wt else "",
                     det.last_stats["n_raw"], det.last_stats["n_kept"],
@@ -833,11 +892,13 @@ def main():
                 tag = lk.state if lk.live else "-"
                 extra = ""
                 if lk.live and lk.state == "pair":
-                    extra = (f"  R({lk.red['cx']:.0f},{lk.red['cy']:.0f}) "
+                    extra = (f"  {lk.mark['kind'][0].upper()}"
+                             f"({lk.mark['cx']:.0f},{lk.mark['cy']:.0f}) "
                              f"W({lk.white['cx']:.0f},{lk.white['cy']:.0f}) "
                              f"sep={lk.sep:.1f}px ang=({ax:+.2f},{ay:+.2f})")
-                elif lk.live and lk.state == "red":
-                    extra = (f"  R({lk.red['cx']:.0f},{lk.red['cy']:.0f}) "
+                elif lk.live and lk.state == "mark":
+                    extra = (f"  {lk.mark['kind'][0].upper()}"
+                             f"({lk.mark['cx']:.0f},{lk.mark['cy']:.0f}) "
                              f"ang=({ax:+.2f},{ay:+.2f})")
                 print(f"{frames:6d} {thr:4d} {det.last_stats['n_raw']:4d} "
                       f"{det.last_stats['n_kept']:4d} "
@@ -849,10 +910,10 @@ def main():
                             f"ang=({ax:+6.2f},{ay:+6.2f})deg"]
                     if lk.state == "pair":
                         bits.append(f"sep={lk.sep:5.1f}px")
-                        bits.append(f"R:pk={lk.red['peak']:3d} red={lk.red['redness']:+5.1f}")
+                        bits.append(mark_text(lk.mark))
                         bits.append(f"W:pk={lk.white['peak']:3d}")
                     else:
-                        bits.append(f"R:pk={lk.red['peak']:3d} red={lk.red['redness']:+5.1f}")
+                        bits.append(mark_text(lk.mark))
                     bits.append(f"fps={fps:4.1f}")
                     print("  ".join(bits), flush=True)
             elif HEARTBEAT_S and (now - last_hb) >= HEARTBEAT_S:
@@ -934,12 +995,12 @@ def main():
                            "frames_recorded": rec.count if rec else 0,
                            "frames_dropped": rec.dropped if rec else 0,
                            "lock_pair_frames": n_pair,
-                           "lock_red_frames": n_red,
+                           "lock_marker_frames": n_red,
                            "no_lock_frames": n_none}, f, indent=2)
             print(f"Output directory: {out_dir}", flush=True)
         tot = max(1, frames)
         print(f"\n{frames} frames: pair lock {n_pair} ({100.0*n_pair/tot:.0f}%), "
-              f"red-only lock {n_red} ({100.0*n_red/tot:.0f}%), "
+              f"marker-only lock {n_red} ({100.0*n_red/tot:.0f}%), "
               f"no target {n_none} ({100.0*n_none/tot:.0f}%)", flush=True)
         if T.static_on:
             print(f"static lights suppressed: up to {det.peak_static} at once "

@@ -2,7 +2,8 @@
 """
 led_detect.py -- base LED detector for the Horus odometry stack.
 
-Finds every bright point source in the frame and labels each one RED or WHITE,
+Finds every bright point source in the frame and labels each one PINK, RED or
+WHITE,
 which is the first stage of the relative-velocity pipeline: once the LEDs on a
 target drone are separated and identified, their known physical spacing turns
 pixel geometry into range, and range plus pixel motion turns into velocity.
@@ -27,6 +28,15 @@ WHAT MAKES THIS DIFFERENT FROM "THRESHOLD AND FIND CONTOURS"
    with G clearly above B. Both are "red-ish" by R - max(G,B) alone, which is
    why a plain redness threshold locks onto ceiling lights. The extra test is
    (G - B) <= WARM_MAX_GB * redness: near zero for an LED, large for a bulb.
+
+3b. PINK is a different kind of test, because pink is not a wavelength. The
+   RGB SMD5050 strobe modules make it by driving the red and blue dies with
+   green off, so the giveaway is not redness at all: it is that GREEN is the
+   minimum channel by a margin, min(R,B) - G well above zero. No broadband
+   source can do that -- a tube, a bulb, daylight or a lit wall all roll off
+   smoothly and leave G between R and B -- which makes it a cleaner test than
+   the red one, with the catch that it has to run FIRST: hot pink also clears
+   RED_MARGIN, so checking red first would label every pink LED red.
 
 4. Colour is read from the HALO, not just the core. A close LED blows its core
    to 255,255,255 -- a red LED and a white LED look identical there. The hue
@@ -110,6 +120,36 @@ RING_MIN_PX      = 6        # below this many ring pixels, trust the core instea
 RED_MARGIN       = 28       # R - max(G,B) at or above this => candidate red
 WARM_MAX_GB      = 0.35     # reject broadband warm light: see note below.
 WHITE_MAX_CHROMA = 22       # max(BGR) - min(BGR) at or below this => white
+
+# --- pink / magenta (the RGB SMD5050 strobe modules) ---
+# Pink is not a wavelength. These modules make it by driving the red and blue
+# dies and leaving green off, so the signature is not "red-ish" at all -- it is
+# GREEN IS THE MINIMUM CHANNEL, by a margin, with red and blue both well above
+# it. That test has no natural false positives: every broadband source in a
+# room (ceiling tube, incandescent, daylight, a lit wall, skin) rolls off
+# smoothly and puts G *between* R and B, so min(R,B) - G lands at or below zero.
+# Nothing in the last run came close.
+#
+# Note this must be tested BEFORE red. Hot pink at roughly (255,105,180) still
+# scores redness = R - max(G,B) = 75, over RED_MARGIN, and its warm term goes
+# strongly negative, which the red test does not reject -- so a pink LED reads
+# as RED unless pink is checked first.
+# 45 is set from measurement, not taste. Over all 5986 blobs of
+# run_20260925_173212 -- every ceiling tube, the red sign, the warm lamp, the
+# blue LEDs, the floor charger -- the green gap had median -9.6, p99 7.4 and a
+# MAXIMUM of 28.4, so the whole room sits below this. A synthetic hot-pink LED
+# scores 77-154, so there is a wide empty band between the two and the exact
+# value is not critical.
+#
+# It must not go much lower, though, and the reason is COLOUR_GAINS below:
+# AWB is off and red and blue are boosted 1.6x over green, so a genuinely
+# NEUTRAL white source lands magenta-tinted and scores about 45 in simulation.
+# The room's real whites are warm (R>G>B) and never came close, but a cool
+# white LED pointed straight at the lens could. If you change COLOUR_GAINS,
+# re-measure this.
+PINK_MIN_GREEN_GAP = 45     # min(R,B) - G at or above this => candidate pink
+PINK_MIN_BLUE_FRAC = 0.30   # B/R below this is just red, not pink
+PINK_MAX_BLUE_FRAC = 1.80   # B/R above this is violet or blue, not pink
 
 # --- exposure lock (picamera2 only; the single most important knob) ---
 LOCK_EXPOSURE = True
@@ -324,13 +364,19 @@ class Params:
         self.red_margin = RED_MARGIN
         self.warm_max_gb = WARM_MAX_GB
         self.white_max_chroma = WHITE_MAX_CHROMA
+        self.pink_min_gap = PINK_MIN_GREEN_GAP
+        self.pink_min_blue_frac = PINK_MIN_BLUE_FRAC
+        self.pink_max_blue_frac = PINK_MAX_BLUE_FRAC
 
     def as_text(self):
         return (f"REL_FRAC={self.rel_frac:.2f} ABS_MIN_V={self.abs_min_v} "
                 f"NOISE_SIGMAS={self.noise_sigmas:.1f} MIN_AREA={self.min_area} "
                 f"RED_MARGIN={self.red_margin} "
                 f"WARM_MAX_GB={self.warm_max_gb:.2f} "
-                f"WHITE_MAX_CHROMA={self.white_max_chroma}")
+                f"WHITE_MAX_CHROMA={self.white_max_chroma} "
+                f"PINK_MIN_GREEN_GAP={self.pink_min_gap} "
+                f"PINK_BLUE_FRAC={self.pink_min_blue_frac:.2f}"
+                f"..{self.pink_max_blue_frac:.2f}")
 
 
 _open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (OPEN_K, OPEN_K)) if OPEN_K >= 3 else None
@@ -346,7 +392,7 @@ def brightness(bgr):
 
 
 def classify(bgr, blob_mask, vch, thr):
-    """Decide red / white / other for one blob, from its core and its halo."""
+    """Decide pink / red / white / other for one blob, from its core and halo."""
     core = blob_mask.astype(bool)
     ring = cv2.dilate(blob_mask, _ring_k).astype(bool) & ~core
     ring &= vch >= RING_MIN_V
@@ -356,17 +402,22 @@ def classify(bgr, blob_mask, vch, thr):
     redness = r - np.maximum(g, b)
     chroma = np.maximum(np.maximum(b, g), r) - np.minimum(np.minimum(b, g), r)
     gb = g - b                       # >0 means a broadband warm source
+    gap = np.minimum(r, b) - g       # >0 means green is the odd one out: pink
 
     def stats(sel):
         return (float(redness[sel].mean()), float(chroma[sel].mean()),
-                float(gb[sel].mean()))
+                float(gb[sel].mean()), float(gap[sel].mean()),
+                float(r[sel].mean()), float(b[sel].mean()))
 
-    red_core, chr_core, gb_core = stats(core) if core.any() else (0.0, 0.0, 0.0)
+    zero = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    red_core, chr_core, gb_core, gap_core, r_core, b_core = (
+        stats(core) if core.any() else zero)
     n_ring = int(ring.sum())
     if n_ring >= RING_MIN_PX:
-        red_ring, chr_ring, gb_ring = stats(ring)
+        red_ring, chr_ring, gb_ring, gap_ring, r_ring, b_ring = stats(ring)
     else:
-        red_ring, chr_ring, gb_ring = red_core, chr_core, gb_core
+        red_ring, chr_ring, gb_ring, gap_ring, r_ring, b_ring = (
+            red_core, chr_core, gb_core, gap_core, r_core, b_core)
 
     # Whichever of core/halo still carries colour is the one to believe.
     if red_ring > red_core:
@@ -376,14 +427,29 @@ def classify(bgr, blob_mask, vch, thr):
     chr_score = max(chr_core, chr_ring)
     warm = gb_score / max(red_score, 1.0)
 
-    if red_score >= P.red_margin and warm <= P.warm_max_gb:
+    # Pink reads off whichever of core/halo shows green suppressed the most.
+    # A blown core goes to 255,255,255 and its gap collapses to zero, so in
+    # practice this picks the halo at close range -- the same reason the red
+    # test reads the halo.
+    if gap_ring > gap_core:
+        gap_score, r_score, b_score = gap_ring, r_ring, b_ring
+    else:
+        gap_score, r_score, b_score = gap_core, r_core, b_core
+    blue_frac = b_score / max(r_score, 1.0)
+
+    if (gap_score >= P.pink_min_gap
+            and P.pink_min_blue_frac <= blue_frac <= P.pink_max_blue_frac):
+        kind = "pink"            # tested first: hot pink also passes the red
+                                 # test, so red would otherwise swallow it
+    elif red_score >= P.red_margin and warm <= P.warm_max_gb:
         kind = "red"
     elif chr_score <= P.white_max_chroma:
         kind = "white"
     else:
-        kind = "other"           # coloured, but not a red LED: warm light, wall,
-                                 # skin, a reflection. Reported, never counted.
-    return kind, red_score, chr_score, n_ring, warm
+        kind = "other"           # coloured, but not a marker LED: warm light,
+                                 # wall, skin, a reflection. Reported, never
+                                 # counted.
+    return kind, red_score, chr_score, n_ring, warm, gap_score, blue_frac
 
 
 def auto_threshold(vch):
@@ -443,7 +509,8 @@ def find_leds(bgr, cxi, cyi, tan_h, tan_v):
 
         sub_bgr = bgr[y0:y1, x0:x1]
         sub_v = vch[y0:y1, x0:x1]
-        kind, redness, chroma, n_ring, warm = classify(sub_bgr, blob, sub_v, thr)
+        kind, redness, chroma, n_ring, warm, pinkness, blue_frac = classify(
+            sub_bgr, blob, sub_v, thr)
 
         bx = (cx - cxi) / cxi
         by = (cy - cyi) / cyi
@@ -452,6 +519,7 @@ def find_leds(bgr, cxi, cyi, tan_h, tan_v):
             peak=int(sub_v[blob > 0].max()),
             sat=int((sub_v[blob > 0] >= 254).sum()),
             redness=redness, chroma=chroma, ring_px=n_ring, warm=warm,
+            pinkness=pinkness, blue_frac=blue_frac,
             x=x, y=y, w=w, h=h,
             ang_x=math.degrees(math.atan(bx * tan_h)),
             ang_y=math.degrees(math.atan(by * tan_v)),
@@ -476,7 +544,9 @@ def spacings(leds):
 
 
 # ============================== OVERLAY ==============================
-COLOURS = {"red": (0, 0, 255), "white": (255, 255, 255), "other": (0, 200, 255)}
+COLOURS = {"red": (0, 0, 255), "white": (255, 255, 255),
+           "pink": (180, 105, 255),      # BGR: hot pink
+           "other": (0, 200, 255)}
 
 
 def annotate(bgr, leds, thr, extra="", mask=None, sel=None):
@@ -508,9 +578,11 @@ def annotate(bgr, leds, thr, extra="", mask=None, sel=None):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
 
     reds = sum(1 for d in leds if d["kind"] == "red")
+    pinks = sum(1 for d in leds if d["kind"] == "pink")
     whites = sum(1 for d in leds if d["kind"] == "white")
     other = sum(1 for d in leds if d["kind"] == "other")
-    cv2.putText(vis, f"thr={thr} red={reds} white={whites} other={other} {extra}",
+    cv2.putText(vis, f"thr={thr} pink={pinks} red={reds} white={whites} "
+                     f"other={other} {extra}",
                 (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return vis
 
@@ -557,6 +629,11 @@ def make_trackbars():
     cv2.createTrackbar("red_margin", TUNE_WIN, P.red_margin, 128, lambda v: None)
     cv2.createTrackbar("warm_max_gb x100", TUNE_WIN, int(P.warm_max_gb * 100), 200, lambda v: None)
     cv2.createTrackbar("white_chroma", TUNE_WIN, P.white_max_chroma, 128, lambda v: None)
+    cv2.createTrackbar("pink_gap", TUNE_WIN, int(P.pink_min_gap), 150, lambda v: None)
+    cv2.createTrackbar("pink_bfrac_lo x100", TUNE_WIN,
+                       int(P.pink_min_blue_frac * 100), 200, lambda v: None)
+    cv2.createTrackbar("pink_bfrac_hi x100", TUNE_WIN,
+                       int(P.pink_max_blue_frac * 100), 400, lambda v: None)
 
 
 def read_trackbars():
@@ -567,6 +644,10 @@ def read_trackbars():
     P.red_margin = cv2.getTrackbarPos("red_margin", TUNE_WIN)
     P.warm_max_gb = cv2.getTrackbarPos("warm_max_gb x100", TUNE_WIN) / 100.0
     P.white_max_chroma = cv2.getTrackbarPos("white_chroma", TUNE_WIN)
+    P.pink_min_gap = float(cv2.getTrackbarPos("pink_gap", TUNE_WIN))
+    P.pink_min_blue_frac = cv2.getTrackbarPos("pink_bfrac_lo x100", TUNE_WIN) / 100.0
+    P.pink_max_blue_frac = max(P.pink_min_blue_frac + 0.05,
+                               cv2.getTrackbarPos("pink_bfrac_hi x100", TUNE_WIN) / 100.0)
 
 
 # ================================ MAIN ================================
@@ -630,6 +711,7 @@ def main():
         csv_w = csv.writer(csv_f)
         csv_w.writerow(["frame", "t_s", "led_i", "kind", "cx", "cy", "area",
                         "peak", "sat_px", "redness", "warm", "chroma",
+                        "pinkness", "blue_frac",
                         "ang_x_deg", "ang_y_deg", "light", "thr"])
     if args.tune:
         make_trackbars()
@@ -648,6 +730,9 @@ def main():
                     "noise_sigmas": P.noise_sigmas, "min_area": P.min_area,
                     "red_margin": P.red_margin, "warm_max_gb": P.warm_max_gb,
                     "white_max_chroma": P.white_max_chroma,
+                    "pink_min_gap": P.pink_min_gap,
+                    "pink_min_blue_frac": P.pink_min_blue_frac,
+                    "pink_max_blue_frac": P.pink_max_blue_frac,
                     "blur_k": BLUR_K, "open_k": OPEN_K, "close_k": CLOSE_K,
                     "ring_px": RING_PX, "max_leds": MAX_LEDS,
                 },
@@ -696,15 +781,18 @@ def main():
                                     f"{d['cx']:.2f}", f"{d['cy']:.2f}", d["area"],
                                     d["peak"], d["sat"], f"{d['redness']:.1f}",
                                     f"{d['warm']:.3f}", f"{d['chroma']:.1f}",
+                                    f"{d['pinkness']:.1f}", f"{d['blue_frac']:.3f}",
                                     f"{d['ang_x']:.3f}", f"{d['ang_y']:.3f}",
                                     f"{d['light']:.0f}", thr])
 
             if leds:
                 if frames % PRINT_EVERY_N == 0:
                     reds = [d for d in leds if d["kind"] == "red"]
+                    pinks = [d for d in leds if d["kind"] == "pink"]
                     whites = [d for d in leds if d["kind"] == "white"]
                     print(f"[t={t_rel:7.2f}s] {len(leds):2d} LED "
-                          f"(red={len(reds)} white={len(whites)}) thr={thr:3d} "
+                          f"(pink={len(pinks)} red={len(reds)} "
+                          f"white={len(whites)}) thr={thr:3d} "
                           f"fps={fps:4.1f}", flush=True)
                     for i, d in enumerate(leds):
                         print(f"    {i}:{d['kind']:<5} "
@@ -712,7 +800,8 @@ def main():
                               f"ang=({d['ang_x']:+6.2f},{d['ang_y']:+6.2f})deg "
                               f"area={d['area']:4d} peak={d['peak']:3d} "
                               f"redness={d['redness']:+6.1f} warm={d['warm']:+5.2f} "
-                              f"chroma={d['chroma']:5.1f}"
+                              f"chroma={d['chroma']:5.1f} "
+                              f"pink={d['pinkness']:+6.1f} b/r={d['blue_frac']:4.2f}"
                               f"{'  SAT' if d['sat'] else ''}", flush=True)
                     sp = spacings(leds)
                     if sp:
