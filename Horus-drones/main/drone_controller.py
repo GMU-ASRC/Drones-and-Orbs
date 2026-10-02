@@ -219,7 +219,13 @@ class DroneController:
 
     # --- arrival tolerances ------------------------------------------------
     POSITION_TOLERANCE = 0.30   # m, for goto()/wait_until_reached()
-    ALTITUDE_TOLERANCE = 0.15   # m, for takeoff()/set_altitude()
+    ALTITUDE_TOLERANCE = 0.50   # m, for takeoff()/set_altitude(). Generous on
+                                # purpose: PX4 settles a position-z setpoint
+                                # wherever its own controller is happy, and a
+                                # 4.0 m command measured 3.6 m -- 0.4 m off,
+                                # which at the old 0.15 m never counted as
+                                # "reached" and timed out a takeoff that had in
+                                # fact finished climbing.
     YAW_TOLERANCE = 5.0         # deg, for face_yaw()
 
     # --- default limits. Nothing this class sends ever exceeds these. ------

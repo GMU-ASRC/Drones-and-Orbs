@@ -3,304 +3,104 @@
 
 The whole mission, in order:
 
-    arm -> take off to --alt -> rotate in place looking for the pink LED
+    arm -> take off to --alt (reached = within --alt-tol)
+    -> hold that altitude for the rest of the flight
+    -> yaw in place at --search-rate looking for the pink LED
     -> no lock within --search-timeout seconds? land.
-    -> lock? yaw onto it and fly forward.
-    -> lock lost? position hold, do nothing, wait for it to come back.
-    -> repeat until Ctrl-C, which lands.
+    -> lock? yaw onto it and fly forward, altitude still held.
+    -> lock lost? stop, hover, wait for it to come back.
+    -> Ctrl-C lands.
 
-Two classes, both thin wrappers over the files that already do the work:
+There are no classes here on purpose. The camera, its detector and the
+pixel-to-bearing geometry are camera_controller.Camera; the aircraft is
+drone_controller.DroneController. This file is the state machine, the logging
+and the flags, and nothing else.
 
-    Detector    camera_controller's pipeline plus a camera, reduced to one
-                question per frame -- where is the target right now?
-    Controller  drone_controller's DroneController plus the four moves this
-                mission makes: take off, search, chase, hold.
+TWO INVARIANTS, BOTH LEARNED THE HARD WAY
 
-EVERY PASS OF THE LOOP ISSUES A COMMAND
-DroneController streams the last setpoint at 20 Hz on its own thread, and a
-VELOCITY setpoint older than COMMAND_TIMEOUT (0.5 s) is dropped in favour of a
-position hold. The old clump_declump loop called this out too. So the loop
-issues exactly one command per pass, in every state.
+1. EVERY PASS OF THE LOOP ISSUES EXACTLY ONE COMMAND.
+   DroneController streams the last setpoint at 20 Hz on its own thread, and a
+   VELOCITY setpoint older than its COMMAND_TIMEOUT (0.5 s) is dropped in
+   favour of a position hold. A pass that issues nothing therefore hands the
+   aircraft back to a position setpoint at the EKF origin. So the loop commands
+   something in every state, including the idle ones. LOOP_HZ must stay well
+   above 1/COMMAND_TIMEOUT = 2 Hz.
+
+2. THE ONLY MOVE USED IS set_velocity_body(..., hold_alt=).
+   Never set_yaw_rate(), brake(), hold_position() or set_altitude(). Those
+   build their setpoint from drone.position, and with no position estimate that
+   is (0,0,0) -- a z target of 0 is the ground, so the drone descends while it
+   spins. hold_alt= instead routes through the same lidar-or-z_ref anchor that
+   takeoff() used, and swaps the setpoint mask from vz to pz: z becomes a
+   POSITION target while forward and right stay velocities. That is what
+   "hold the altitude and never change it" means in practice.
 
 ONE THING TO KNOW ABOUT LOST LOCKS
-camera_controller's Lock keeps a target alive for COAST_FRAMES after it stops
-being seen, carrying it forward on its last velocity. That is good for keeping
-a TRACK through a blink and bad as a reason to keep flying -- its own docstring
-says so. This loop therefore brakes on the FIRST frame without a fresh
-bearing, while leaving the coasting lock in place so re-acquisition is instant.
+The tracker keeps a target alive for a few frames after it stops being seen,
+carrying it forward on its last velocity -- the 'coast' state. Camera.read()
+deliberately does not report a coasting lock as fresh, so this loop never flies
+on a dead-reckoned position. It does tolerate brief dropouts: a lock counts as
+held while a fresh bearing has arrived within LOST_GRACE_S, because
+single-frame flicker is constant (the recorded pink run flickers 54 times in
+823 frames) and reacting to each one makes the drone stutter instead of fly.
 
 RANGE, OR THE LACK OF IT
-A single camera gives bearing, not distance. When both LEDs are visible their
-separation in pixels is a range proxy (bigger = closer), and --stop-sep-px
-stops the forward motion at a standoff. When only the marker is visible -- the
-normal case at distance -- there is NO range information at all and nothing
-here will stop the drone short of the target. Fly it where a fly-through is
-survivable, or keep a hand on the kill switch.
+A single camera gives bearing, not distance. Nothing here knows how far away
+the target is and nothing here will stop the drone short of it. Fly it where a
+fly-through is survivable, or keep a hand on the kill switch.
 """
 import argparse
 import csv
 import logging
-import math
 import os
 import sys
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-# camera_controller does `import led_detect`, which lives one directory over in
-# opencv-tests. Put that on the path before importing it.
-sys.path.insert(0, os.path.join(os.path.dirname(HERE), "opencv-tests"))
+import camera_controller as cam
+from drone_controller import DroneController
 
-import camera_controller as cam          # noqa: E402
-import led_detect as L                   # noqa: E402
-# drone_controller is imported lazily inside Controller, so --dry-run can
-# exercise the camera path on a machine that has no pymavlink installed.
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ----------------------------- TUNABLES -----------------------------
-# Gains marked (proven) are the values the old clump_declump loop flew on this
-# airframe. Kept rather than re-derived.
-ALT_M             = 1.5     # takeoff and cruise altitude, m above the ground
+# Gains marked (proven) are the values this airframe has already flown on.
+ALT_M             = 4.0     # takeoff and cruise altitude, m above the ground
+ALT_TOL_M         = 0.5     # "reached altitude" threshold. PX4 settles a
+                            # position-z setpoint wherever its own controller
+                            # is happy -- a 4.0 m command measured 3.6 m -- so
+                            # a tight tolerance times out a climb that in fact
+                            # finished.
+SEARCH_YAW_RATE   = 10.0    # deg/s while sweeping for the first lock (proven).
+                            # The 24.3 deg FOV takes 2.4 s to cross at this
+                            # rate, so a target sits in shot for plenty of
+                            # frames even at the ~10 fps this detector really
+                            # runs at on a Zero 2W.
 SEARCH_TIMEOUT_S  = 60.0    # give up and land after this long with no lock.
                             # Starts when the altitude is REACHED, not at arm.
-SEARCH_YAW_RATE   = 10.0    # deg/s while sweeping for the first lock (proven).
-                            # The 24.3 deg FOV takes 2.4 s to pass at this rate,
-                            # so a target sits in shot for plenty of frames even
-                            # at the ~10 fps this detector really runs at.
 TRACK_YAW_GAIN    = 2.0     # deg/s of yaw per deg of bearing error (proven)
 TRACK_YAW_MAX     = 45.0    # deg/s cap while tracking (proven)
 CENTER_TOL_DEG    = 4.0     # only translate once the bearing is inside this
-                            # (proven). Outside it, yaw only.
+                            # (proven). Outside it, yaw only, so the drone
+                            # never arcs around the target.
 FORWARD_SPEED     = 0.5     # m/s at the target, once centred (proven)
-STOP_SEP_PX       = 45.0    # pair separation at which to stop closing. Only
-                            # meaningful on a 'pair' lock; see the module note
-                            # on range. 0 disables it.
-
-LOST_GRACE_S      = 0.5     # how long a lock may go unseen before it counts as
-                            # LOST. Single-frame dropouts are constant -- the
-                            # recorded pink run flickers 54 times in 823 frames
-                            # -- and reacting to each one makes the drone
-                            # stutter instead of fly.
-LOOP_HZ           = 20.0    # must stay above 1/COMMAND_TIMEOUT = 2 Hz. The
-                            # camera paces the loop in practice (~10 fps).
+LOST_GRACE_S      = 1.0     # how long a lock may go unseen before it counts
+                            # as LOST. See the note on flicker above.
+LOOP_HZ           = 20.0    # see invariant 1. The camera paces the loop in
+                            # practice (~10 fps).
 # --------------------------------------------------------------------
 
 STATE_SEARCH = "SEARCH"
 STATE_TRACK  = "TRACK"
 STATE_HOLD   = "HOLD"
 
-
-class Sighting:
-    """What the camera has to say about one frame.
-
-    fresh   a bearing measured THIS frame. The only thing worth flying on.
-    state   camera_controller's lock state: pair, mark, coast or none.
-    ang_x   degrees right of centre (positive = target is to the right)
-    ang_y   degrees below centre (positive = target is low in the frame)
-    sep_px  marker-to-white separation, 0 unless state is 'pair'
-    """
-
-    __slots__ = ("fresh", "state", "ang_x", "ang_y", "sep_px", "frame_i", "t")
-
-    def __init__(self, fresh, state, ang_x, ang_y, sep_px, frame_i, t):
-        self.fresh = fresh
-        self.state = state
-        self.ang_x = ang_x
-        self.ang_y = ang_y
-        self.sep_px = sep_px
-        self.frame_i = frame_i
-        self.t = t
-
-    def __str__(self):
-        if not self.fresh:
-            return f"{self.state}"
-        s = f"{self.state} ang=({self.ang_x:+.2f},{self.ang_y:+.2f})deg"
-        if self.sep_px:
-            s += f" sep={self.sep_px:.1f}px"
-        return s
-
-
-class Detector:
-    """The camera and camera_controller's pipeline, as one target bearing."""
-
-    def __init__(self, source="picam", res=(640, 480), fps=30.0,
-                 marker="pink", record_dir=None, record_every=1,
-                 record_format="jpg", record_quality=92, log=None):
-        self.log = log or logging.getLogger("detect")
-        cam.T.marker = marker               # pink-only by default: the module
-                                            # ships "both", which also accepts
-                                            # the old red LED.
-        self.w, self.h = res
-        self.src = L.open_source(source, res, fps, True)
-        self.det = cam.Detector()
-
-        # Pixel-to-bearing geometry, straight out of camera_controller.main.
-        self.cxi, self.cyi = self.w / 2.0, self.h / 2.0
-        self.tan_h = math.tan(math.radians(L.HFOV_DEG / 2))
-        self.tan_v = math.tan(math.radians(L.VFOV_DEG / 2))
-
-        # Frame recording, if asked for. led_detect's Recorder encodes and
-        # writes on a background thread and DROPS frames when its queue backs
-        # up rather than blocking -- which is the only reason this is safe to
-        # switch on in a flight loop. Drops are counted, never hidden.
-        self.rec = None
-        if record_dir:
-            self.rec = L.Recorder(record_dir, record_format, record_quality,
-                                  record_every)
-            rate = fps / max(1, record_every)
-            kb = 30 if record_format == "jpg" else 240
-            self.log.info("recording frames to %s/frames (~%.1f MB/min)",
-                          record_dir, rate * kb * 60 / 1024)
-
-        self.frames = 0
-        self.t0 = time.time()
-        self.fps = 0.0
-        self._t_prev = self.t0
-
-    def read(self):
-        """Grab and process one frame. None when the source is exhausted."""
-        frame = self.src.read()
-        if frame is None:
-            return None
-        if frame.shape[1] != self.w or frame.shape[0] != self.h:
-            import cv2
-            frame = cv2.resize(frame, (self.w, self.h),
-                               interpolation=cv2.INTER_AREA)
-
-        live, dropped, mask, thr = self.det.process(
-            frame, self.cxi, self.cyi, self.tan_h, self.tan_v)
-
-        self.frames += 1
-        now = time.time()
-        dt = now - self._t_prev
-        self._t_prev = now
-        if dt > 0:
-            self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
-        t_rel = now - self.t0
-
-        if self.rec is not None:
-            self.rec.write(self.frames, t_rel, frame,
-                           self.det.last_stats["n_kept"], thr)
-
-        lk = self.det.lock
-        # 'pair' or 'mark' means a bearing was measured this frame. 'coast' is
-        # the tracker carrying a stale position forward -- not a measurement,
-        # and explicitly not something to fly on.
-        fresh = lk.live and lk.state in ("pair", "mark")
-        ang_x = ang_y = 0.0
-        if fresh:
-            ang_x, ang_y = cam.bearing(lk.cx, lk.cy, self.cxi, self.cyi,
-                                       self.tan_h, self.tan_v)
-        state = lk.state if lk.live else "none"
-        sep = lk.sep if (fresh and lk.state == "pair") else 0.0
-        return Sighting(fresh, state, ang_x, ang_y, sep, self.frames, t_rel)
-
-    def close(self):
-        if self.rec is not None:
-            self.log.info("frames recorded=%d dropped=%d",
-                          self.rec.count, self.rec.dropped)
-            self.rec.close()
-        try:
-            self.src.close()
-        except Exception:
-            pass
-
-
-class Controller:
-    """The drone, and the four moves this mission makes.
-
-    Takeoff is drone_controller's own takeoff(), which is the hover-test
-    sequence: stream the pose it is sitting in, engage offboard, arm, raise the
-    z target, wait for the climb. That works, so it is used as-is.
-    """
-
-    def __init__(self, conn_str="udpout:127.0.0.1:14551", alt=ALT_M, log=None):
-        from drone_controller import DroneController
-
-        self.log = log or logging.getLogger("fly")
-        self.alt = alt
-        # DroneController's own status lines go to the same log, so the flight
-        # record is one file in one order.
-        self.drone = DroneController(conn_str=conn_str, log=self._relay)
-
-    def _relay(self, msg):
-        self.log.info("drone: %s", msg)
-
-    # ---- lifecycle ----
-    def connect(self):
-        self.log.info("CMD connect %s", self.drone.conn_str)
-        if not self.drone.connect():
-            self.log.error("no heartbeat -- is mavp2p up?")
-            return False
-        self.drone.start()
-        # Let the reader thread pick up a pose, the way hover-test waits for
-        # its first LOCAL_POSITION_NED. Not gated on: takeoff() checks it.
-        self.drone.wait_for_position(timeout=5.0)
-        self.log.info("connected: %s", self.drone.status_line())
-        return True
-
-    def takeoff(self):
-        self.log.info("CMD arm + takeoff to %.2f m", self.alt)
-        ok = self.drone.takeoff(alt=self.alt)
-        self.log.info("CMD takeoff %s at %.2f m",
-                      "OK" if ok else "FAILED", self.drone.altitude)
-        return ok
-
-    def land(self, why=""):
-        self.log.info("CMD land%s", f" ({why})" if why else "")
-        ok = self.drone.land_and_wait()
-        self.log.info("CMD land %s", "OK" if ok else "TIMED OUT")
-        return ok
-
-    def close(self):
-        self.drone.close()
-
-    # ---- the three flight behaviours, one call per loop pass ----
-    def search(self):
-        """Spin in place, holding height.
-
-        NOT set_yaw_rate(): that anchors on drone.position, which with no
-        position estimate is (0,0,0) -- so its z target is 0, i.e. the ground,
-        and the drone descends while it spins. hold_alt= takes the altitude
-        from _alt_to_down() instead, which is the same z target takeoff used.
-        """
-        self.drone.set_velocity_body(forward=0.0, right=0.0,
-                                     yaw_rate=SEARCH_YAW_RATE,
-                                     hold_alt=self.alt)
-        return 0.0, SEARCH_YAW_RATE
-
-    def chase(self, s):
-        """Yaw onto the target, then fly at it.
-
-        Centre first, then translate -- the gate the old clump_declump loop
-        flew. Outside CENTER_TOL_DEG it only turns, so it never arcs around
-        the target.
-        """
-        yaw_rate = max(-TRACK_YAW_MAX,
-                       min(TRACK_YAW_MAX, TRACK_YAW_GAIN * s.ang_x))
-        if abs(s.ang_x) > CENTER_TOL_DEG:
-            forward = 0.0
-        elif STOP_SEP_PX and s.sep_px and s.sep_px >= STOP_SEP_PX:
-            forward = 0.0           # close enough: keep facing it, stop closing
-        else:
-            forward = FORWARD_SPEED
-        # hold_alt locks the vertical axis to a height while translating.
-        self.drone.set_velocity_body(forward=forward, yaw_rate=yaw_rate,
-                                     hold_alt=self.alt)
-        return forward, yaw_rate
-
-    def hold(self):
-        """Stop translating, hold heading and height.
-
-        NOT brake()/hold_position(), for the same reason as search(): both
-        build their setpoint from drone.position, and a z of 0 means fly to
-        the ground. Zero commanded velocity drifts where a position hold
-        would not, but there is no position to hold to.
-        """
-        self.drone.set_velocity_body(forward=0.0, right=0.0, yaw_rate=0.0,
-                                     hold_alt=self.alt)
-        return 0.0, 0.0
-
-    def status(self):
-        return self.drone.status_line()
+# One row per loop pass. The flight record from OUR code -- not the flight
+# controller's logs -- so a run can be reconstructed without pulling the FC.
+CSV_HEADER = ["frame", "t_s", "state", "fresh", "lock_state",
+              "ang_x_deg", "ang_y_deg", "sep_px",
+              "cmd_fwd_mps", "cmd_yaw_rate_dps",
+              "altitude_m", "alt_agl_m", "alt_local_m", "z_ref",
+              "yaw_deg", "pos_n", "pos_e", "pos_d", "vn", "ve", "vd",
+              "mode", "armed", "rangefinder_ok", "flow_quality",
+              "batt_v", "batt_pct", "fps"]
 
 
 def setup_logging(run_dir, verbose=False):
@@ -314,8 +114,9 @@ def setup_logging(run_dir, verbose=False):
     log = logging.getLogger("clump")
     log.setLevel(logging.DEBUG)
     log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
-                            datefmt="%H:%M:%S")
+    fmt = logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S")
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     sh.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -327,33 +128,84 @@ def setup_logging(run_dir, verbose=False):
     return log
 
 
+def _f(v, spec=".3f"):
+    """Format a value that may be None into a CSV cell."""
+    if v is None:
+        return ""
+    return format(v, spec)
+
+
+def flight_row(drone, camera, s, state, fwd, yaw_rate):
+    """One CSV row, read straight off DroneController's public telemetry."""
+    n, e, d = drone.position
+    vn, ve, vd = drone.velocity
+    return [s.frame_i, _f(s.t), state, int(s.fresh), s.state,
+            _f(s.ang_x) if s.fresh else "",
+            _f(s.ang_y) if s.fresh else "",
+            _f(s.sep_px, ".2f") if s.sep_px else "",
+            _f(fwd), _f(yaw_rate, ".2f"),
+            _f(drone.altitude, ".3f"), _f(drone.alt_agl, ".3f"),
+            _f(drone.alt_local, ".3f"), _f(drone.z_ref, ".3f"),
+            _f(drone.yaw, ".2f"),
+            _f(n), _f(e), _f(d), _f(vn), _f(ve), _f(vd),
+            drone.mode_name, int(bool(drone.armed)),
+            int(bool(drone.rangefinder_ok)),
+            drone.flow_quality if drone.flow_quality is not None else "",
+            _f(drone.battery_v, ".2f"), _f(drone.battery_pct, ".0f"),
+            _f(camera.fps, ".1f")]
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    # --- link ---
     ap.add_argument("--conn", default="udpout:127.0.0.1:14551",
                     help="mavp2p endpoint (default %(default)s)")
+    # --- camera ---
     ap.add_argument("--source", default="picam",
                     help="'picam', a camera index, a video or a run directory")
     ap.add_argument("--res", default="640x480")
     ap.add_argument("--fps", type=float, default=30.0)
-    ap.add_argument("--alt", type=float, default=ALT_M,
-                    help="takeoff and cruise altitude in m (default %(default)s)")
-    ap.add_argument("--search-timeout", type=float, default=SEARCH_TIMEOUT_S,
-                    help="land if no lock within this many seconds of reaching "
-                         "altitude (default %(default)s)")
     ap.add_argument("--marker", choices=("pink", "red", "both"), default="pink",
                     help="colour of the target's LED (default %(default)s)")
+    # --- flight ---
+    ap.add_argument("--alt", type=float, default=ALT_M,
+                    help="takeoff and cruise altitude in m (default %(default)s)")
+    ap.add_argument("--alt-tol", type=float, default=ALT_TOL_M, metavar="M",
+                    help="altitude-reached threshold in m (default %(default)s)")
+    ap.add_argument("--search-rate", type=float, default=SEARCH_YAW_RATE,
+                    metavar="DPS",
+                    help="yaw rate in deg/s while searching (default %(default)s)")
+    ap.add_argument("--search-timeout", type=float, default=SEARCH_TIMEOUT_S,
+                    metavar="S",
+                    help="land if no lock within this many seconds of reaching "
+                         "altitude (default %(default)s)")
+    ap.add_argument("--yaw-gain", type=float, default=TRACK_YAW_GAIN,
+                    help="deg/s of yaw per deg of bearing error "
+                         "(default %(default)s)")
+    ap.add_argument("--yaw-max", type=float, default=TRACK_YAW_MAX, metavar="DPS",
+                    help="yaw rate cap while tracking (default %(default)s)")
+    ap.add_argument("--center-tol", type=float, default=CENTER_TOL_DEG,
+                    metavar="DEG",
+                    help="only fly forward once the bearing is inside this "
+                         "(default %(default)s)")
+    ap.add_argument("--speed", type=float, default=FORWARD_SPEED, metavar="MPS",
+                    help="forward speed at the target (default %(default)s)")
+    # --- recording and logs ---
     ap.add_argument("--record", action="store_true",
-                    help="save every camera frame (background thread, drops "
-                         "frames rather than stalling the loop)")
+                    help="save every raw camera frame, so the run can be "
+                         "replayed through the detector afterwards")
     ap.add_argument("--record-every", type=int, default=1, metavar="N",
                     help="with --record, keep every Nth frame")
+    ap.add_argument("--record-format", choices=("jpg", "png"), default="jpg")
+    ap.add_argument("--record-video", action="store_true",
+                    help="also write an annotated flight.mp4 of what the "
+                         "detector saw")
     ap.add_argument("--out", default=None, help="run directory for logs")
     ap.add_argument("--verbose", action="store_true",
                     help="put per-frame lock flicker on the console too; it is "
                          "always in mission.log either way")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="camera and detector only -- never touches the drone")
     args = ap.parse_args()
 
     w, h = (int(v) for v in args.res.lower().split("x"))
@@ -362,57 +214,80 @@ def main():
     log = setup_logging(run_dir, args.verbose)
 
     log.info("=== clump-control-loop %s ===", run_id)
-    log.info("source=%s %dx%d@%.0f marker=%s alt=%.2fm search_timeout=%.0fs",
-             args.source, w, h, args.fps, args.marker, args.alt,
-             args.search_timeout)
+    log.info("source=%s %dx%d@%.0f marker=%s", args.source, w, h, args.fps,
+             args.marker)
+    log.info("alt=%.2fm (+/-%.2fm) search=%.1fdeg/s timeout=%.0fs "
+             "speed=%.2fm/s centre=%.1fdeg",
+             args.alt, args.alt_tol, args.search_rate, args.search_timeout,
+             args.speed, args.center_tol)
     log.info("logging to %s", run_dir)
 
-    det = Detector(source=args.source, res=(w, h), fps=args.fps,
-                   marker=args.marker,
-                   record_dir=run_dir if args.record else None,
-                   record_every=args.record_every, log=log)
+    # --- camera: the frame source, the detector and the bearing geometry ---
+    camera = cam.Camera(source=args.source, res=(w, h), fps=args.fps,
+                        marker=args.marker,
+                        record_dir=run_dir if args.record else None,
+                        record_format=args.record_format,
+                        record_every=args.record_every,
+                        record_video=(os.path.join(run_dir, "flight.mp4")
+                                      if args.record_video else None),
+                        log=lambda m: log.info("cam: %s", m))
+    log.info("camera on %s", camera.name)
 
-    ctl = None
-    if not args.dry_run:
-        ctl = Controller(conn_str=args.conn, alt=args.alt, log=log)
-        if not ctl.connect():
-            det.close()
-            return 1
-        if not ctl.takeoff():
-            ctl.land("takeoff failed")
-            ctl.close()
-            det.close()
-            return 1
-    else:
-        log.warning("DRY RUN: detector only, no drone commands")
+    # --- aircraft ---
+    # DroneController's own status lines and PX4's STATUSTEXT are relayed into
+    # the same logger, so the flight record is one file in one order.
+    drone = DroneController(conn_str=args.conn,
+                            log=lambda m: log.info("drone: %s", m))
+    # Instance attribute shadows the class default: the altitude check
+    # threshold is stated here, in the mission, rather than being inherited
+    # from whatever drone_controller happens to be set to.
+    drone.ALTITUDE_TOLERANCE = args.alt_tol
+
+    flight_csv = open(os.path.join(run_dir, "flight.csv"), "w", newline="")
+    fw = csv.writer(flight_csv)
+    fw.writerow(CSV_HEADER)
 
     state = STATE_SEARCH
-    search_deadline = time.monotonic() + args.search_timeout
-    # A lock is held as long as a fresh bearing has arrived within
-    # LOST_GRACE_S. `have_lock` is that smoothed view; s.fresh is the raw
-    # per-frame one, and the gap between them is the flicker the grace window
-    # exists to absorb.
     have_lock = False
     t_last_fresh = 0.0
     n_locks = n_losses = n_flickers = 0
     last_hb = 0.0
     period = 1.0 / LOOP_HZ
+    airborne = False
     exit_code = 0
 
-    # One row per frame: the complete lock history, for post-flight analysis.
-    lock_csv = open(os.path.join(run_dir, "lock.csv"), "w", newline="")
-    lw = csv.writer(lock_csv)
-    lw.writerow(["frame", "t_s", "mission_state", "fresh", "lock_state",
-                 "ang_x_deg", "ang_y_deg", "sep_px", "fwd_mps", "yaw_rate_dps",
-                 "alt_m"])
-
-    log.info("STATE -> %s (rotating, %.0fs to find a lock)",
-             state, args.search_timeout)
-
     try:
+        log.info("CMD connect %s", args.conn)
+        if not drone.connect():
+            log.error("no heartbeat -- is mavp2p up?")
+            return 1
+        drone.start()
+        drone.wait_for_position(timeout=5.0)
+        log.info("connected: %s", drone.status_line())
+
+        # Takeoff is drone_controller's own sequence, unchanged and ungated:
+        # stream the pose it is sitting in, engage offboard, arm, raise the z
+        # target, wait for the climb. No lidar/flow/estimator preflight of our
+        # own -- the flight controller checks those itself and will refuse or
+        # fail over before anything here would notice.
+        log.info("CMD arm + takeoff to %.2f m (reached within %.2f m)",
+                 args.alt, args.alt_tol)
+        if not drone.takeoff(alt=args.alt):
+            log.error("CMD takeoff FAILED at %.2f m", drone.altitude)
+            airborne = True          # it may be off the ground; land anyway
+            return 1
+        airborne = True
+        log.info("CMD takeoff OK at %.2f m -- holding this altitude for the "
+                 "rest of the flight", drone.altitude)
+
+        # The search clock starts now, at altitude, not at arm.
+        search_deadline = time.monotonic() + args.search_timeout
+        log.info("STATE -> %s (yawing at %.1f deg/s, %.0fs to find a lock)",
+                 state, args.search_rate, args.search_timeout)
+
         while True:
             t0 = time.monotonic()
-            s = det.read()
+            s = camera.read()
             if s is None:
                 log.warning("camera source exhausted")
                 break
@@ -457,49 +332,40 @@ def main():
                     log.info("STATE -> %s (stop closing, wait for the lock)",
                              state)
             elif state == STATE_HOLD:
-                # No sweep and no timeout here, by design: the spec is hold
-                # until the lock returns.
+                # No sweep and no timeout here, by design: hold until the lock
+                # comes back, or until Ctrl-C.
                 if have_lock:
                     state = STATE_TRACK
                     log.info("STATE -> %s (lock regained)", state)
 
             # ---- exactly ONE command, every pass, in every state ----
-            # Not tidiness: a pass that issues nothing lets the velocity
-            # setpoint pass COMMAND_TIMEOUT, and the stream thread then
-            # substitutes hold_position() -- a position setpoint at the EKF
-            # origin. See the module docstring.
-            fwd = yaw_rate = 0.0
-            if ctl:
-                if state == STATE_SEARCH:
-                    fwd, yaw_rate = ctl.search()
-                elif state == STATE_TRACK and s.fresh:
-                    fwd, yaw_rate = ctl.chase(s)
-                else:
-                    # HOLD, or TRACK inside the grace window: stop closing but
-                    # keep height and heading.
-                    fwd, yaw_rate = ctl.hold()
+            # See invariant 1. Altitude is a hold in all three branches and is
+            # never commanded to change; s.ang_y is recorded but not acted on.
+            if state == STATE_SEARCH:
+                fwd, yaw_rate = 0.0, args.search_rate
+            elif state == STATE_TRACK and s.fresh:
+                # Centre first, then translate.
+                yaw_rate = max(-args.yaw_max,
+                               min(args.yaw_max, args.yaw_gain * s.ang_x))
+                fwd = args.speed if abs(s.ang_x) <= args.center_tol else 0.0
+            else:
+                # HOLD, or TRACK inside the grace window: stop closing but keep
+                # height and heading.
+                fwd, yaw_rate = 0.0, 0.0
+            drone.set_velocity_body(forward=fwd, right=0.0, yaw_rate=yaw_rate,
+                                    hold_alt=args.alt)
 
-            agl = ctl.drone.altitude if ctl else None
+            fw.writerow(flight_row(drone, camera, s, state, fwd, yaw_rate))
+
             if state == STATE_TRACK and s.fresh and s.frame_i % 15 == 0:
-                log.info("TRACK %s -> fwd=%.2fm/s yaw=%+.1fdeg/s alt=%s fps=%.1f",
-                         s, fwd, yaw_rate,
-                         f"{agl:.2f}m" if agl is not None else "--", det.fps)
+                log.info("TRACK %s -> fwd=%.2fm/s yaw=%+.1fdeg/s alt=%.2fm "
+                         "fps=%.1f", s, fwd, yaw_rate, drone.altitude,
+                         camera.fps)
 
-            lw.writerow([s.frame_i, f"{s.t:.3f}", state, int(s.fresh), s.state,
-                         f"{s.ang_x:.3f}" if s.fresh else "",
-                         f"{s.ang_y:.3f}" if s.fresh else "",
-                         f"{s.sep_px:.2f}" if s.sep_px else "",
-                         f"{fwd:.3f}", f"{yaw_rate:.2f}",
-                         f"{agl:.2f}" if agl is not None else ""])
-
-            # ---- heartbeat ----
-            # No health gate here: the flight controller checks lidar, flow and
-            # estimator itself and will refuse or fail over before anything in
-            # this loop would notice.
             if now - last_hb >= 2.0:
                 last_hb = now
-                log.debug("%s %s fps=%.1f%s", state, s, det.fps,
-                          f" {ctl.status()}" if ctl else "")
+                log.debug("%s %s fps=%.1f %s", state, s, camera.fps,
+                          drone.status_line())
 
             sleep = period - (time.monotonic() - t0)
             if sleep > 0:
@@ -507,14 +373,20 @@ def main():
 
     except KeyboardInterrupt:
         log.info("Ctrl-C -- landing")
+    except Exception:
+        log.exception("unhandled error -- landing")
+        exit_code = 1
     finally:
-        if ctl:
-            ctl.land("mission end")
-            ctl.close()
-        det.close()
-        lock_csv.close()
+        # close() neither lands nor disarms, so landing is explicit.
+        if airborne:
+            log.info("CMD land")
+            log.info("CMD land %s",
+                     "OK" if drone.land_and_wait() else "TIMED OUT")
+        drone.close()
+        camera.close()
+        flight_csv.close()
         log.info("=== done: %d frames, %d locks, %d losses, %d flickers "
-                 "absorbed ===", det.frames, n_locks, n_losses, n_flickers)
+                 "absorbed ===", camera.frames, n_locks, n_losses, n_flickers)
         log.info("run directory: %s", run_dir)
 
     return exit_code

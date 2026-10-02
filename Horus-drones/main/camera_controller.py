@@ -136,6 +136,8 @@ import csv
 import json
 import math
 import os
+import queue
+import threading
 import time
 
 import cv2
@@ -760,6 +762,240 @@ def mark_text(m):
 def bearing(cx, cy, cxi, cyi, tan_h, tan_v):
     return (math.degrees(math.atan((cx - cxi) / cxi * tan_h)),
             math.degrees(math.atan((cy - cyi) / cyi * tan_v)))
+
+
+class Sighting:
+    """What the camera has to say about one frame.
+
+    fresh   a bearing measured THIS frame. The only thing worth flying on.
+    state   the lock state: pair, mark, coast or none.
+    ang_x   degrees right of centre (positive = target is to the right)
+    ang_y   degrees below centre (positive = target is low in the frame)
+    sep_px  marker-to-white separation, 0 unless state is 'pair'
+    """
+
+    __slots__ = ("fresh", "state", "ang_x", "ang_y", "sep_px", "frame_i", "t")
+
+    def __init__(self, fresh, state, ang_x, ang_y, sep_px, frame_i, t):
+        self.fresh = fresh
+        self.state = state
+        self.ang_x = ang_x
+        self.ang_y = ang_y
+        self.sep_px = sep_px
+        self.frame_i = frame_i
+        self.t = t
+
+    def __str__(self):
+        if not self.fresh:
+            return f"{self.state}"
+        s = f"{self.state} ang=({self.ang_x:+.2f},{self.ang_y:+.2f})deg"
+        if self.sep_px:
+            s += f" sep={self.sep_px:.1f}px"
+        return s
+
+
+class VideoRecorder:
+    """Writes annotated frames to an mp4 on a background thread.
+
+    Same contract as led_detect.Recorder and for the same reason: an H.264-ish
+    encode is a large slice of a 25-33 ms frame budget on a Zero 2W, and doing
+    it inline would drag the detection rate -- and therefore the rate the
+    control loop issues setpoints -- down with it. The queue is bounded and a
+    full queue DROPS the frame rather than blocking. Drops are counted, never
+    hidden.
+
+    The writer is opened lazily on the first frame, because cv2.VideoWriter
+    needs the frame size and only the first frame knows it for sure.
+    """
+
+    def __init__(self, path, fps, queue_len=48):
+        self.path = path
+        self.fps = fps if fps and fps > 0 else L.TARGET_FPS
+        self.count = 0
+        self.dropped = 0
+        self.vw = None
+        self.q = queue.Queue(maxsize=queue_len)
+        self.thread = threading.Thread(target=self._drain, daemon=True)
+        self.thread.start()
+
+    def _drain(self):
+        while True:
+            frame = self.q.get()
+            if frame is None:
+                break
+            if self.vw is None:
+                h, w = frame.shape[:2]
+                self.vw = cv2.VideoWriter(
+                    self.path, cv2.VideoWriter_fourcc(*"mp4v"),
+                    self.fps, (w, h))
+                if not self.vw.isOpened():
+                    print(f"            !! cannot open {self.path}", flush=True)
+                    self.vw = None
+                    return
+            try:
+                self.vw.write(frame)
+            except cv2.error as e:
+                print(f"            !! video write failed: {e}", flush=True)
+        if self.vw is not None:
+            self.vw.release()
+            self.vw = None
+
+    def write(self, frame):
+        try:
+            # copy: the source may hand back the same buffer next frame
+            self.q.put_nowait(frame.copy())
+        except queue.Full:
+            self.dropped += 1
+            return
+        self.count += 1
+
+    def close(self):
+        self.q.put(None)
+        self.thread.join(timeout=10.0)
+
+
+class Camera:
+    """A frame source, the Detector, and the pixel-to-bearing geometry.
+
+    One question per frame: where is the target right now? Everything the
+    answer needs -- opening the camera, locking its exposure, running the
+    detection pipeline, turning a pixel into a bearing, and recording the run
+    for review -- lives here, so a mission loop can import this and do nothing
+    but fly.
+
+        camera = Camera(source="picam", marker="pink")
+        while True:
+            s = camera.read()
+            if s is None:
+                break
+            if s.fresh:
+                ...                     # s.ang_x, s.ang_y are degrees
+        camera.close()
+
+    Recording is optional and independent:
+        record_dir=   raw UNANNOTATED frames + frames.csv, via led_detect's
+                      Recorder. Unannotated on purpose -- the overlay renders
+                      one particular set of gates, and the recording is worth
+                      far more if the filter can be re-run over it with
+                      different ones.
+        record_video= an annotated mp4, for watching what the detector saw.
+    Both write on background threads and drop frames rather than stall.
+
+    ONE CAMERA PER PROCESS. The gate values live in the module singletons T
+    (here) and L.P (led_detect), so setting marker= mutates process-global
+    state and two Camera instances would share gates.
+    """
+
+    def __init__(self, source="picam", res=L.PROC_RES, fps=L.TARGET_FPS,
+                 marker="pink", learn_static=0, lock_exposure=True,
+                 record_dir=None, record_format=L.REC_FORMAT,
+                 record_quality=L.REC_QUALITY, record_every=1,
+                 record_video=None, log=None):
+        self._log = log or (lambda m: print(m, flush=True))
+
+        # The marker gate. identify() tests pink BEFORE red on purpose -- hot
+        # pink scores redness ~75 and red would otherwise swallow it -- and the
+        # pink thresholds are already in this module. Nothing new is needed
+        # here to detect pink; it is one assignment.
+        T.marker = marker
+
+        self.w, self.h = int(res[0]), int(res[1])
+        self.fps_target = fps
+        # Opening a picam blocks ~1.5 s and locks exposure, gain and AWB. The
+        # pink gates are calibrated against exactly that locked white balance
+        # (red and blue boosted 1.6x) -- see the warning in led_detect.
+        self.src = L.open_source(source, (self.w, self.h), fps, lock_exposure)
+        self.det = Detector(learn_static=learn_static)
+
+        # Pixel-to-bearing geometry. The only place this math lives.
+        self.cxi, self.cyi = self.w / 2.0, self.h / 2.0
+        self.tan_h = math.tan(math.radians(L.HFOV_DEG / 2))
+        self.tan_v = math.tan(math.radians(L.VFOV_DEG / 2))
+
+        self.rec = None
+        if record_dir:
+            os.makedirs(record_dir, exist_ok=True)
+            self.rec = L.Recorder(record_dir, record_format, record_quality,
+                                  record_every)
+            rate = fps / max(1, record_every)
+            approx_kb = 30 if record_format == "jpg" else 240
+            self._log(f"recording raw frames to {self.rec.dir} "
+                      f"-- ~{rate * approx_kb * 60 / 1024:.0f} MB/min, "
+                      f"watch the card")
+
+        self.vid = None
+        if record_video:
+            d = os.path.dirname(os.path.abspath(record_video))
+            if d:
+                os.makedirs(d, exist_ok=True)
+            self.vid = VideoRecorder(record_video, fps)
+            self._log(f"recording annotated video to {record_video}")
+
+        self.frames = 0
+        self.fps = 0.0
+        self.t0 = time.time()
+        self._t_prev = self.t0
+
+    @property
+    def name(self):
+        return self.src.name
+
+    def read(self):
+        """Grab and process one frame. None when the source is exhausted."""
+        frame = self.src.read()
+        if frame is None:
+            return None
+        if frame.shape[1] != self.w or frame.shape[0] != self.h:
+            frame = cv2.resize(frame, (self.w, self.h),
+                               interpolation=cv2.INTER_AREA)
+
+        live, dropped, mask, thr = self.det.process(
+            frame, self.cxi, self.cyi, self.tan_h, self.tan_v)
+
+        self.frames += 1
+        now = time.time()
+        dt = now - self._t_prev
+        self._t_prev = now
+        if dt > 0:
+            self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
+        t_rel = now - self.t0
+
+        if self.rec is not None:
+            self.rec.write(self.frames, t_rel, frame,
+                           self.det.last_stats["n_kept"], thr)
+        if self.vid is not None:
+            self.vid.write(annotate(frame, live, dropped, self.det, thr,
+                                    extra=f"{self.fps:.1f}fps"))
+
+        lk = self.det.lock
+        # 'pair' or 'mark' means a bearing was MEASURED this frame. 'coast' is
+        # the tracker dead-reckoning a stale position forward -- good for
+        # holding a track through a blink, and explicitly not something to fly
+        # on. So coast is not fresh.
+        fresh = lk.live and lk.state in ("pair", "mark")
+        ang_x = ang_y = 0.0
+        if fresh:
+            ang_x, ang_y = bearing(lk.cx, lk.cy, self.cxi, self.cyi,
+                                   self.tan_h, self.tan_v)
+        state = lk.state if lk.live else "none"
+        sep = lk.sep if (fresh and lk.state == "pair") else 0.0
+        return Sighting(fresh, state, ang_x, ang_y, sep, self.frames, t_rel)
+
+    def close(self):
+        if self.rec is not None:
+            self._log(f"frames recorded={self.rec.count} "
+                      f"dropped={self.rec.dropped}")
+            self.rec.close()
+            self.rec = None
+        if self.vid is not None:
+            self._log(f"video frames written={self.vid.count} "
+                      f"dropped={self.vid.dropped}")
+            self.vid.close()
+            self.vid = None
+        try:
+            self.src.close()
+        except Exception as e:
+            self._log(f"camera close failed: {e}")
 
 
 def main():
