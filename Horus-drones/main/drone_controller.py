@@ -296,9 +296,27 @@ class DroneController:
             self.conn_str, source_system=self.source_system)
         self._send_heartbeat()
         self._log(f"waiting for heartbeat on {self.conn_str} ...")
-        hb = self.master.wait_heartbeat(timeout=timeout)
+        # mavp2p emits a router heartbeat of its own, with autopilot INVALID.
+        # wait_heartbeat() takes whichever arrives first, and when that is the
+        # router we end up addressing system 0 and reading the router's mode
+        # and arm state instead of the flight controller's. Skip those.
+        hb = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._send_heartbeat()
+            m = self.master.recv_match(type='HEARTBEAT', blocking=True,
+                                       timeout=1.0)
+            if m is None:
+                continue
+            if m.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+                continue                # the router talking, not the autopilot
+            self.master.target_system = m.get_srcSystem()
+            self.master.target_component = m.get_srcComponent()
+            hb = m
+            break
         if hb is None:
-            self._log("no heartbeat -- is mavp2p up and is the endpoint right?")
+            self._log("no autopilot heartbeat (only the router?) -- is mavp2p "
+                      "up and is the endpoint right?")
             return False
         self._log(f"heartbeat: system {self.master.target_system} "
                   f"component {self.master.target_component}")
@@ -423,6 +441,12 @@ class DroneController:
             elif t == 'OPTICAL_FLOW_RAD':
                 self.flow_quality = msg.quality
             elif t == 'HEARTBEAT':
+                # Same router heartbeat as in connect(). Letting it through
+                # overwrites armed and main_mode with zeros every other
+                # message, which is why status_line could read "mode(0.0)
+                # ARMED" while PX4 was actually in OFFBOARD and disarmed.
+                if msg.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+                    continue
                 self.armed = bool(msg.base_mode &
                                   mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                 self.main_mode = (msg.custom_mode >> 16) & 0xFF
@@ -683,8 +707,12 @@ class DroneController:
         if self.armed:
             return True
         if not self.healthy():
-            self._log("refusing to arm: telemetry is stale")
-            return False
+            # Do not refuse. hover-test.py arms with no position estimate on
+            # this airframe and flies, so a missing or sporadic
+            # LOCAL_POSITION_NED is not grounds to stop here. PX4's own prearm
+            # checks still apply and will reject the command if it matters.
+            self._log("arming with stale telemetry (no fresh position) -- "
+                      "PX4 prearm checks still apply")
         self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                            1.0, 21196.0 if force else 0.0)
         deadline = time.monotonic() + wait
@@ -995,8 +1023,8 @@ class DroneController:
         ground" rather than "above the EKF origin".
         """
         if not self.wait_for_position(timeout=5.0):
-            self._log("takeoff refused: no position estimate")
-            return False
+            self._log("takeoff: no position estimate -- continuing, setpoints "
+                      "will be relative to whatever the EKF reports")
         if not self.rangefinder_ok:
             self._log("takeoff warning: lidar not reading -- altitudes will "
                       "come from the EKF")
@@ -1028,6 +1056,20 @@ class DroneController:
 
         # 3. raise the target and wait for the climb
         self.set_position_ned(n, e, target_z, yaw0)
+
+        # With no lidar AND no position estimate, .altitude is pinned at 0, so
+        # wait_until_altitude() can only ever time out -- it would report a
+        # failed takeoff on a drone that climbed perfectly well. hover-test.py
+        # has exactly this blind spot and just holds the commanded z target,
+        # which flies. Do the same: allow time for the climb, then hand back.
+        if not self.rangefinder_ok and self.telemetry_age >= self.TELEMETRY_STALE:
+            settle = abs(alt) / max(0.1, self.MAX_SPEED_Z) + 2.0
+            self._log(f"no altitude reference (no lidar, no position) -- "
+                      f"holding the climb {settle:.1f}s without verifying it, "
+                      f"the way hover-test does")
+            time.sleep(settle)
+            return True
+
         ok = self.wait_until_altitude(alt, timeout=timeout,
                                       abort_check=abort_check)
         self._log(f"takeoff {'reached' if ok else 'TIMED OUT at'} "

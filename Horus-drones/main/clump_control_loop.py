@@ -255,8 +255,16 @@ class Controller:
 
     # ---- the three flight behaviours, one call per loop pass ----
     def search(self):
-        """Spin in place, holding position and height."""
-        self.drone.set_yaw_rate(SEARCH_YAW_RATE)
+        """Spin in place, holding height.
+
+        NOT set_yaw_rate(): that anchors on drone.position, which with no
+        position estimate is (0,0,0) -- so its z target is 0, i.e. the ground,
+        and the drone descends while it spins. hold_alt= takes the altitude
+        from _alt_to_down() instead, which is the same z target takeoff used.
+        """
+        self.drone.set_velocity_body(forward=0.0, right=0.0,
+                                     yaw_rate=SEARCH_YAW_RATE,
+                                     hold_alt=self.alt)
         return 0.0, SEARCH_YAW_RATE
 
     def chase(self, s):
@@ -280,8 +288,15 @@ class Controller:
         return forward, yaw_rate
 
     def hold(self):
-        """Position hold on the spot."""
-        self.drone.brake()
+        """Stop translating, hold heading and height.
+
+        NOT brake()/hold_position(), for the same reason as search(): both
+        build their setpoint from drone.position, and a z of 0 means fly to
+        the ground. Zero commanded velocity drifts where a position hold
+        would not, but there is no position to hold to.
+        """
+        self.drone.set_velocity_body(forward=0.0, right=0.0, yaw_rate=0.0,
+                                     hold_alt=self.alt)
         return 0.0, 0.0
 
     def status(self):
