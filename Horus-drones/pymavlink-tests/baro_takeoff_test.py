@@ -1,0 +1,551 @@
+"""Autonomous takeoff on IMU + barometer only, with no GPS, flow or rangefinder
+in the loop. Streams body-rate + thrust setpoints to PX4 OFFBOARD and closes
+altitude from raw SCALED_PRESSURE.
+
+Run: python3 baro_takeoff_test.py --mode dry
+"""
+
+import argparse
+import csv
+import logging
+import math
+import os
+import threading
+import time
+
+from pymavlink import mavutil
+
+CONN = "udpout:127.0.0.1:14551"
+SOURCE_SYSTEM = 255
+
+STREAM_HZ = 20.0            # setpoint rate; PX4 drops offboard after COM_OF_LOSS_T=1.0s
+HEARTBEAT_HZ = 1.0
+LOOP_HZ = 20.0
+
+TARGET_ALT_M = 1.0
+HOVER_S = 10.0
+CLIMB_TIMEOUT_S = 15.0
+
+HOVER_THRUST = 0.5          # MPC_THR_HOVER on this airframe
+THRUST_MIN = 0.0
+THRUST_MAX = 0.70
+BENCH_THRUST_MAX = 0.25     # props-off ceiling: enough to confirm mixer response
+BENCH_RAMP_S = 4.0
+BENCH_HOLD_S = 3.0
+
+KP_ALT = 0.12               # thrust per metre of error, about hover
+KI_ALT = 0.04
+KD_ALT = 0.08
+
+# Watchdog limits. Any trip disarms immediately.
+MAX_TILT_DEG = 20.0
+ALT_OVERSHOOT_M = 1.5       # above target before we call it a runaway
+BARO_STALE_S = 0.5
+ATT_STALE_S = 0.5
+RUN_TIMEOUT_S = 90.0
+
+# h = 44330 * (1 - (p/p0) ** (1/5.255)), the ISA barometric formula.
+BARO_SCALE_M = 44330.0
+BARO_EXP = 1.0 / 5.255
+
+CSV_HEADER = [
+    "t", "phase", "baro_alt_m", "press_hpa", "alt_err_m", "thrust",
+    "roll_deg", "pitch_deg", "yaw_deg",
+    "roll_rate_dps", "pitch_rate_dps", "yaw_rate_dps",
+    "fused_alt_m", "rng_m", "mode", "armed",
+]
+
+log = logging.getLogger("baro_takeoff")
+
+
+class Fault(Exception):
+    """A watchdog tripped. The caller disarms on sight of this."""
+
+
+def baro_alt_m(press_hpa, ref_hpa):
+    """Altitude above the pressure reference taken at arm time."""
+    return BARO_SCALE_M * (1.0 - (press_hpa / ref_hpa) ** BARO_EXP)
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else (hi if v > hi else v)
+
+
+class AltPid:
+    """Altitude error in metres to a normalized thrust offset about hover."""
+
+    def __init__(self, kp, ki, kd, out_min, out_max):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.out_min, self.out_max = out_min, out_max
+        self.integral = 0.0
+        self.prev_err = None
+
+    def step(self, err_m, dt_s):
+        deriv = 0.0 if self.prev_err is None else (err_m - self.prev_err) / dt_s
+        self.prev_err = err_m
+
+        raw = self.kp * err_m + self.ki * self.integral + self.kd * deriv
+        out = clamp(raw, self.out_min, self.out_max)
+
+        # Only accumulate when the output has somewhere to go, or the integral
+        # winds up against the ceiling and the loop never comes back down.
+        if raw == out:
+            self.integral += err_m * dt_s
+        return out
+
+
+class Link:
+    """A standalone PX4 MAVLink link: heartbeat, telemetry, setpoint stream.
+
+    Public units are metres, degrees and degrees/second. Thrust is 0..1.
+    """
+
+    # PX4 packs modes into HEARTBEAT.custom_mode as (main << 16) | (sub << 24).
+    MODES = {
+        "OFFBOARD": (6, 0),
+        "AUTO.LAND": (4, 6),
+        "AUTO.LOITER": (4, 3),
+    }
+
+    # SET_ATTITUDE_TARGET mask is an ignore-list: drop the quaternion, keep
+    # body rates and thrust.
+    RATE_MASK = 0b10000000
+
+    def __init__(self, conn=CONN):
+        self.master = mavutil.mavlink_connection(conn, source_system=SOURCE_SYSTEM)
+
+        self.press_hpa = None
+        self.press_t = 0.0
+        self.attitude_deg = (0.0, 0.0, 0.0)
+        self.rates_dps = (0.0, 0.0, 0.0)
+        self.att_t = 0.0
+        self.fused_alt_m = float("nan")
+        self.rng_m = float("nan")
+        self.main_mode = 0
+        self.sub_mode = 0
+        self.armed = False
+
+        self._sp = (0.0, 0.0, 0.0, 0.0)
+        self._tx_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._threads = []
+
+    @property
+    def mode_name(self):
+        for name, ms in self.MODES.items():
+            if ms == (self.main_mode, self.sub_mode):
+                return name
+        return "main=%d sub=%d" % (self.main_mode, self.sub_mode)
+
+    def connect(self, timeout=30.0):
+        """Latch onto the flight controller, not the mavp2p router."""
+        self._send_heartbeat()   # mavp2p won't route to an endpoint it hasn't heard from
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1.0)
+            if msg is None:
+                self._send_heartbeat()
+                continue
+            # The router emits its own heartbeat with autopilot INVALID. Taking
+            # it means addressing system 0 and reading the router's arm state.
+            if msg.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+                continue
+            self.master.target_system = msg.get_srcSystem()
+            self.master.target_component = msg.get_srcComponent()
+            log.info("heartbeat: system %d component %d",
+                     self.master.target_system, self.master.target_component)
+            return
+
+        raise Fault("no flight controller heartbeat in %.0fs" % timeout)
+
+    def request_streams(self):
+        m = mavutil.mavlink
+        wanted = [
+            (m.MAVLINK_MSG_ID_SCALED_PRESSURE, 25.0),
+            (m.MAVLINK_MSG_ID_ATTITUDE, 50.0),
+            (m.MAVLINK_MSG_ID_ALTITUDE, 10.0),
+            (m.MAVLINK_MSG_ID_DISTANCE_SENSOR, 10.0),
+            (m.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, 2.0),
+        ]
+        for msg_id, hz in wanted:
+            self._command_long(m.MAV_CMD_SET_MESSAGE_INTERVAL,
+                               float(msg_id), 1e6 / hz)
+
+    def start(self):
+        for target in (self._reader_loop, self._heartbeat_loop, self._stream_loop):
+            t = threading.Thread(target=target, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def close(self):
+        self._stop.set()
+        for t in self._threads:
+            t.join(timeout=1.0)
+        self.master.close()
+
+    def _reader_loop(self):
+        while not self._stop.is_set():
+            msg = self.master.recv_match(blocking=True, timeout=0.5)
+            if msg is None or msg.get_srcSystem() != self.master.target_system:
+                continue
+
+            kind = msg.get_type()
+            if kind == "SCALED_PRESSURE":
+                self.press_hpa = msg.press_abs
+                self.press_t = time.monotonic()
+            elif kind == "ATTITUDE":
+                self.attitude_deg = (math.degrees(msg.roll),
+                                     math.degrees(msg.pitch),
+                                     math.degrees(msg.yaw))
+                self.rates_dps = (math.degrees(msg.rollspeed),
+                                  math.degrees(msg.pitchspeed),
+                                  math.degrees(msg.yawspeed))
+                self.att_t = time.monotonic()
+            elif kind == "ALTITUDE":
+                self.fused_alt_m = msg.altitude_local
+            elif kind == "DISTANCE_SENSOR":
+                self.rng_m = msg.current_distance / 100.0
+            elif kind == "HEARTBEAT":
+                self.main_mode = (msg.custom_mode >> 16) & 0xFF
+                self.sub_mode = (msg.custom_mode >> 24) & 0xFF
+                self.armed = bool(msg.base_mode &
+                                  mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            elif kind == "STATUSTEXT":
+                log.info("px4: %s", msg.text)
+
+    def _heartbeat_loop(self):
+        while not self._stop.wait(1.0 / HEARTBEAT_HZ):
+            self._send_heartbeat()
+
+    def _stream_loop(self):
+        dt = 1.0 / STREAM_HZ
+        next_t = time.monotonic()
+        while not self._stop.is_set():
+            roll_rate, pitch_rate, yaw_rate, thrust = self._sp
+            with self._tx_lock:
+                self.master.mav.set_attitude_target_send(
+                    0, self.master.target_system, self.master.target_component,
+                    self.RATE_MASK, (1.0, 0.0, 0.0, 0.0),
+                    math.radians(roll_rate), math.radians(pitch_rate),
+                    math.radians(yaw_rate), thrust)
+
+            next_t += dt
+            sleep = next_t - time.monotonic()
+            if sleep > 0:
+                time.sleep(sleep)
+            else:
+                next_t = time.monotonic()   # fell behind; don't accrue debt
+
+    def set_rates(self, roll_rate=0.0, pitch_rate=0.0, yaw_rate=0.0, thrust=0.0):
+        self._sp = (roll_rate, pitch_rate, yaw_rate,
+                    clamp(thrust, THRUST_MIN, THRUST_MAX))
+
+    def _send_heartbeat(self):
+        with self._tx_lock:
+            self.master.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+
+    def _command_long(self, command, p1=0.0, p2=0.0, p3=0.0, p4=0.0):
+        with self._tx_lock:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                command, 0, p1, p2, p3, p4, 0.0, 0.0, 0.0)
+
+    def set_mode(self, name, wait=3.0):
+        main, sub = self.MODES[name]
+        self._command_long(mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                           mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                           float(main), float(sub))
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if (self.main_mode, self.sub_mode) == (main, sub):
+                log.info("CMD mode %s OK", name)
+                return True
+            time.sleep(0.05)
+        log.error("CMD mode %s FAILED (still %s)", name, self.mode_name)
+        return False
+
+    def arm(self, wait=5.0):
+        log.info("CMD arm")
+        self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1.0)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if self.armed:
+                log.info("CMD arm OK")
+                return True
+            time.sleep(0.05)
+        log.error("CMD arm FAILED")
+        return False
+
+    def disarm(self):
+        """Force-disarm. This is the fault response, so it does not wait."""
+        log.warning("CMD disarm (force)")
+        self.set_rates(thrust=0.0)
+        self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                           0.0, 21196.0)
+
+
+class Recorder:
+    def __init__(self, run_dir):
+        self.fh = open(os.path.join(run_dir, "flight.csv"), "w", newline="")
+        self.csv = csv.writer(self.fh)
+        self.csv.writerow(CSV_HEADER)
+        self.t0 = time.monotonic()
+
+    def row(self, link, phase, alt_m, err_m, thrust):
+        roll, pitch, yaw = link.attitude_deg
+        roll_rate, pitch_rate, yaw_rate = link.rates_dps
+        self.csv.writerow([
+            "%.3f" % (time.monotonic() - self.t0), phase,
+            "%.3f" % alt_m, "%.2f" % (link.press_hpa or 0.0),
+            "%.3f" % err_m, "%.3f" % thrust,
+            "%.2f" % roll, "%.2f" % pitch, "%.2f" % yaw,
+            "%.2f" % roll_rate, "%.2f" % pitch_rate, "%.2f" % yaw_rate,
+            "%.3f" % link.fused_alt_m, "%.3f" % link.rng_m,
+            link.mode_name, int(link.armed),
+        ])
+        self.fh.flush()
+
+    def close(self):
+        self.fh.close()
+
+
+def check_watchdogs(link, alt_m, target_alt_m, elapsed_s):
+    now = time.monotonic()
+    roll, pitch, _ = link.attitude_deg
+
+    if now - link.press_t > BARO_STALE_S:
+        raise Fault("barometer stale %.2fs" % (now - link.press_t))
+    if now - link.att_t > ATT_STALE_S:
+        raise Fault("attitude stale %.2fs" % (now - link.att_t))
+    if max(abs(roll), abs(pitch)) > MAX_TILT_DEG:
+        raise Fault("tilt %.1f deg exceeds %.1f" %
+                    (max(abs(roll), abs(pitch)), MAX_TILT_DEG))
+    if alt_m > target_alt_m + ALT_OVERSHOOT_M:
+        raise Fault("altitude %.2fm overshot target %.2fm" % (alt_m, target_alt_m))
+    if elapsed_s > RUN_TIMEOUT_S:
+        raise Fault("run exceeded %.0fs" % RUN_TIMEOUT_S)
+
+
+def wait_for_telemetry(link, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if link.press_hpa is not None and link.att_t > 0.0:
+            log.info("telemetry up: %.2f hPa, attitude live", link.press_hpa)
+            return
+        time.sleep(0.1)
+    raise Fault("no barometer or attitude telemetry in %.0fs" % timeout)
+
+
+def take_reference(link, samples=20):
+    """Average the ground pressure so altitude starts from zero here."""
+    readings = []
+    while len(readings) < samples:
+        if link.press_hpa is not None:
+            readings.append(link.press_hpa)
+        time.sleep(0.05)
+    ref = sum(readings) / len(readings)
+    spread_m = baro_alt_m(min(readings), ref) - baro_alt_m(max(readings), ref)
+    log.info("baro reference %.2f hPa, sample spread %.2f m", ref, abs(spread_m))
+    return ref
+
+
+def run_dry(link, rec, args):
+    """Stream setpoints and engage OFFBOARD without ever arming."""
+    ref_hpa = take_reference(link)
+    link.set_rates(thrust=0.0)
+    time.sleep(1.0)              # PX4 wants setpoints flowing before the mode request
+
+    if not link.set_mode("OFFBOARD"):
+        raise Fault("PX4 refused OFFBOARD")
+
+    log.info("OFFBOARD accepted while disarmed; holding %.0fs", args.dry_seconds)
+    deadline = time.monotonic() + args.dry_seconds
+    period = 1.0 / LOOP_HZ
+    while time.monotonic() < deadline:
+        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
+        rec.row(link, "dry", alt_m, 0.0, 0.0)
+        time.sleep(period)
+
+    log.info("dry run complete, nothing was armed")
+
+
+def run_bench(link, rec, args):
+    """Props-off thrust ramp under a hard ceiling. No altitude feedback."""
+    ref_hpa = take_reference(link)
+    link.set_rates(thrust=0.0)
+    time.sleep(1.0)
+
+    if not link.set_mode("OFFBOARD"):
+        raise Fault("PX4 refused OFFBOARD")
+    if not link.arm():
+        raise Fault("arm refused")
+
+    period = 1.0 / LOOP_HZ
+    t_start = time.monotonic()
+    total_s = BENCH_RAMP_S + BENCH_HOLD_S + BENCH_RAMP_S
+
+    while True:
+        elapsed = time.monotonic() - t_start
+        if elapsed >= total_s:
+            break
+
+        if elapsed < BENCH_RAMP_S:
+            frac = elapsed / BENCH_RAMP_S
+        elif elapsed < BENCH_RAMP_S + BENCH_HOLD_S:
+            frac = 1.0
+        else:
+            frac = 1.0 - (elapsed - BENCH_RAMP_S - BENCH_HOLD_S) / BENCH_RAMP_S
+
+        thrust = BENCH_THRUST_MAX * frac
+        link.set_rates(thrust=thrust)
+
+        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
+        check_watchdogs(link, alt_m, args.alt, elapsed)
+        rec.row(link, "bench", alt_m, 0.0, thrust)
+        time.sleep(period)
+
+    link.set_rates(thrust=0.0)
+    link.disarm()
+    log.info("bench ramp complete, peak thrust %.2f", BENCH_THRUST_MAX)
+
+
+def run_fly(link, rec, args):
+    """Climb to target on the baro PID, hover, then hand off to AUTO.LAND."""
+    ref_hpa = take_reference(link)
+    link.set_rates(thrust=0.0)
+    time.sleep(1.0)
+
+    if not link.set_mode("OFFBOARD"):
+        raise Fault("PX4 refused OFFBOARD")
+    if not link.arm():
+        raise Fault("arm refused")
+
+    pid = AltPid(KP_ALT, KI_ALT, KD_ALT,
+                 THRUST_MIN - HOVER_THRUST, THRUST_MAX - HOVER_THRUST)
+    period = 1.0 / LOOP_HZ
+    t_start = time.monotonic()
+    t_reached = None
+    prev_t = t_start
+
+    while True:
+        now = time.monotonic()
+        dt = now - prev_t
+        prev_t = now
+        elapsed = now - t_start
+
+        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
+        err_m = args.alt - alt_m
+        check_watchdogs(link, alt_m, args.alt, elapsed)
+
+        thrust = HOVER_THRUST + pid.step(err_m, max(dt, 1e-3))
+        link.set_rates(thrust=thrust)
+
+        phase = "climb" if t_reached is None else "hover"
+        rec.row(link, phase, alt_m, err_m, thrust)
+
+        if t_reached is None:
+            if abs(err_m) < args.alt_tol:
+                t_reached = now
+                log.info("STATE -> hover at %.2fm after %.1fs", alt_m, elapsed)
+            elif elapsed > CLIMB_TIMEOUT_S:
+                raise Fault("climb to %.2fm timed out at %.2fm" % (args.alt, alt_m))
+        elif now - t_reached >= args.hover:
+            break
+
+        time.sleep(period)
+
+    log.info("CMD land")
+    if not link.set_mode("AUTO.LAND"):
+        raise Fault("PX4 refused AUTO.LAND")
+
+    deadline = time.monotonic() + 30.0
+    while link.armed and time.monotonic() < deadline:
+        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
+        rec.row(link, "land", alt_m, 0.0, 0.0)
+        time.sleep(period)
+
+    if link.armed:
+        raise Fault("still armed 30s after AUTO.LAND")
+    log.info("landed and disarmed")
+
+
+def setup_logging(run_dir, verbose=False):
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
+                            datefmt="%H:%M:%S")
+    root = logging.getLogger("baro_takeoff")
+    root.setLevel(logging.DEBUG)
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    fh = logging.FileHandler(os.path.join(run_dir, "mission.log"))
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mode", choices=("dry", "bench", "fly"), default="dry",
+                   help="dry: stream only, never arms. bench: props-off thrust "
+                        "ramp. fly: closed-loop takeoff.")
+    p.add_argument("--conn", default=CONN)
+    p.add_argument("--alt", type=float, default=TARGET_ALT_M, metavar="M")
+    p.add_argument("--alt-tol", type=float, default=0.30, metavar="M")
+    p.add_argument("--hover", type=float, default=HOVER_S, metavar="S")
+    p.add_argument("--dry-seconds", type=float, default=15.0, metavar="S")
+    p.add_argument("--out", default=None, metavar="DIR")
+    p.add_argument("--verbose", action="store_true")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    run_dir = args.out or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "runs", "baro_takeoff_" + time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+    setup_logging(run_dir, args.verbose)
+    log.info("mode=%s alt=%.2fm run_dir=%s", args.mode, args.alt, run_dir)
+
+    if args.mode != "dry":
+        log.warning("%s mode ARMS THE VEHICLE. Props off for bench. 5s to abort.",
+                    args.mode)
+        time.sleep(5.0)
+
+    link = Link(args.conn)
+    rec = None
+    try:
+        link.connect()
+        link.request_streams()
+        link.start()
+        wait_for_telemetry(link)
+
+        rec = Recorder(run_dir)
+        {"dry": run_dry, "bench": run_bench, "fly": run_fly}[args.mode](link, rec, args)
+
+    except Fault as exc:
+        log.error("FAULT: %s", exc)
+        if link.armed:
+            link.disarm()
+        raise
+    except KeyboardInterrupt:
+        log.warning("interrupted")
+        if link.armed:
+            link.disarm()
+    finally:
+        link.set_rates(thrust=0.0)
+        if rec is not None:
+            rec.close()
+        link.close()
+        log.info("logs in %s", run_dir)
+
+
+if __name__ == "__main__":
+    main()
