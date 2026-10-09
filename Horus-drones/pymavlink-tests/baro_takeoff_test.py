@@ -52,6 +52,29 @@ MAX_DESCENT_MPS = 0.3
 KP_CLIMB = 0.12             # thrust per m/s of climb error
 KI_CLIMB = 0.08             # thrust per m/s of climb error held for a second
 
+# Takeoff spool-up. The ramp measures hover thrust instead of trusting
+# HOVER_THRUST, which on this airframe is the unmeasured PX4 default. Liftoff
+# is detected from a sustained rise in FILTERED altitude: the climb estimate
+# carries +/-0.44 m/s of noise while stationary, which swamps any rate
+# threshold worth setting.
+SPOOL_START_THRUST = 0.20
+SPOOL_RATE_PER_S = 0.03     # slow: the measured hover is biased high by
+                            # roughly rate * the 1.0s detection lag
+SPOOL_THRUST_MAX = 0.75     # hard ceiling on the open-loop ramp
+SPOOL_TIMEOUT_S = 25.0
+SPOOL_BASELINE_S = 1.0      # average the ground altitude before ramping
+LIFTOFF_RISE_M = 0.15       # about 3.3 sigma on filtered altitude
+LIFTOFF_HOLD_S = 0.4
+LIFTOFF_MARGIN = 0.03       # SPOOL_RATE_PER_S * detection lag
+
+# Thrust authority allowed either side of the MEASURED hover point. This is the
+# safety property that matters: baro liftoff detection is ~1 s late, so the
+# aircraft is already climbing at over 1 m/s at handover. Without a band this
+# airframe (T/W 5-9) overshoots past ALT_OVERSHOOT_M and the watchdog disarms
+# it in the air. +0.06 caps upward acceleration near 0.12 g.
+THRUST_BAND_UP = 0.06
+THRUST_BAND_DN = 0.10
+
 # Watchdog limits. Any trip disarms immediately.
 MAX_TILT_DEG = 20.0
 ALT_OVERSHOOT_M = 1.5       # above target before we call it a runaway
@@ -66,7 +89,7 @@ BARO_EXP = 1.0 / 5.255
 CSV_HEADER = [
     "t", "phase", "alt_sp_m", "alt_raw_m", "alt_filt_m", "alt_err_m",
     "climb_sp_mps", "climb_mps", "climb_err_mps",
-    "thrust", "thrust_p", "thrust_i",
+    "thrust", "thrust_p", "thrust_i", "hover_ff",
     "press_hpa", "roll_deg", "pitch_deg", "yaw_deg",
     "roll_rate_dps", "pitch_rate_dps", "yaw_rate_dps",
     "fused_alt_m", "rng_m", "mode", "armed",
@@ -353,7 +376,7 @@ class Recorder:
 
     def row(self, link, phase, alt_sp=0.0, alt_raw=0.0, alt_filt=0.0,
             err_m=0.0, climb_sp=0.0, climb=0.0,
-            thrust=0.0, th_p=0.0, th_i=0.0):
+            thrust=0.0, th_p=0.0, th_i=0.0, hover_ff=0.0):
         roll, pitch, yaw = link.attitude_deg
         roll_rate, pitch_rate, yaw_rate = link.rates_dps
         self.csv.writerow([
@@ -361,6 +384,7 @@ class Recorder:
             "%.3f" % alt_sp, "%.3f" % alt_raw, "%.3f" % alt_filt, "%.3f" % err_m,
             "%.3f" % climb_sp, "%.3f" % climb, "%.3f" % (climb_sp - climb),
             "%.3f" % thrust, "%.3f" % th_p, "%.3f" % th_i,
+            "%.3f" % hover_ff,
             "%.2f" % (link.press_hpa or 0.0),
             "%.2f" % roll, "%.2f" % pitch, "%.2f" % yaw,
             "%.2f" % roll_rate, "%.2f" % pitch_rate, "%.2f" % yaw_rate,
@@ -490,14 +514,78 @@ def run_bench(link, rec, args):
     log.info("bench ramp complete, peak thrust %.2f", BENCH_THRUST_MAX)
 
 
+def spool_to_liftoff(link, rec, est, args):
+    """Ramp thrust until the aircraft leaves the ground; return what lifted it.
+
+    A fixed feedforward that is too high launches at well over 1 g, and the
+    filters lag far enough that the overshoot watchdog fires before the loop
+    catches it. Ramping finds the real number on the way up.
+    """
+    t_start = prev_t = time.monotonic()
+    t_rising = None
+    ground = []
+    baseline = None
+    log.info("spool from %.2f at %.2f/s, watching for %.2fm rise",
+             args.spool_start, SPOOL_RATE_PER_S, LIFTOFF_RISE_M)
+
+    while True:
+        now = time.monotonic()
+        dt = max(now - prev_t, 1e-3)
+        prev_t = now
+        elapsed = now - t_start
+
+        alt, climb = est.step(link.press_hpa, dt)
+        check_watchdogs(link, est.raw, args.alt, elapsed)
+
+        # Hold at idle first and average the ground altitude. A single sample
+        # carries 0.1 m of noise, which is most of the liftoff threshold.
+        if elapsed < SPOOL_BASELINE_S:
+            ground.append(alt)
+            link.set_rates(thrust=args.spool_start)
+            rec.row(link, "spool", alt_sp=args.alt, alt_raw=est.raw,
+                    alt_filt=alt, climb=climb, thrust=args.spool_start)
+            time.sleep(1.0 / LOOP_HZ)
+            continue
+        if baseline is None:
+            baseline = sum(ground) / len(ground)
+            log.info("ground baseline %.3fm from %d samples", baseline, len(ground))
+
+        thrust = min(args.spool_start
+                     + SPOOL_RATE_PER_S * (elapsed - SPOOL_BASELINE_S),
+                     SPOOL_THRUST_MAX)
+        link.set_rates(thrust=thrust)
+        rec.row(link, "spool", alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
+                err_m=args.alt - alt, climb=climb, thrust=thrust)
+
+        if alt - baseline >= LIFTOFF_RISE_M:
+            if t_rising is None:
+                t_rising = now
+            elif now - t_rising >= LIFTOFF_HOLD_S:
+                hover_ff = clamp(thrust - LIFTOFF_MARGIN,
+                                 args.spool_start, THRUST_MAX)
+                log.info("liftoff at thrust %.3f after %.1fs -> hover "
+                         "feedforward %.3f (HOVER_THRUST was %.3f)",
+                         thrust, elapsed, hover_ff, HOVER_THRUST)
+                return hover_ff
+        else:
+            t_rising = None
+
+        if elapsed > SPOOL_TIMEOUT_S:
+            raise Fault("no liftoff by thrust %.2f in %.0fs -- props off, "
+                        "tied down, or underpowered" % (thrust, elapsed))
+
+        time.sleep(1.0 / LOOP_HZ)
+
+
 def run_fly(link, rec, args):
-    """Climb to target on the filtered baro cascade, hover, then AUTO.LAND."""
+    """Spool up to find hover thrust, climb on the cascade, hover, AUTO.LAND."""
     ref_hpa = take_reference(link)
     engage_offboard(link, arm=True)
 
     est = AltEstimator(ref_hpa, link.press_hpa)
+    hover_ff = spool_to_liftoff(link, rec, est, args)
     pi = ClimbPi(args.kp_climb, args.ki_climb,
-                 THRUST_MIN - HOVER_THRUST, THRUST_MAX - HOVER_THRUST)
+                 -THRUST_BAND_DN, THRUST_BAND_UP)
 
     period = 1.0 / LOOP_HZ
     t_start = prev_t = time.monotonic()
@@ -516,13 +604,13 @@ def run_fly(link, rec, args):
         err_m = args.alt - alt
         climb_sp = clamp(args.kp_alt * err_m, -MAX_DESCENT_MPS, MAX_CLIMB_MPS)
         offset, th_p, th_i = pi.step(climb_sp - climb, dt)
-        thrust = HOVER_THRUST + offset
+        thrust = hover_ff + offset
         link.set_rates(thrust=thrust)
 
         phase = "climb" if t_reached is None else "hover"
         rec.row(link, phase, alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
                 err_m=err_m, climb_sp=climb_sp, climb=climb,
-                thrust=thrust, th_p=th_p, th_i=th_i)
+                thrust=thrust, th_p=th_p, th_i=th_i, hover_ff=hover_ff)
 
         if t_reached is None:
             # Require the error to STAY in tolerance, or baro noise alone
@@ -553,7 +641,7 @@ def run_fly(link, rec, args):
         prev_t = now
         alt, climb = est.step(link.press_hpa, dt)
         rec.row(link, "land", alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
-                climb=climb)
+                climb=climb, hover_ff=hover_ff)
         time.sleep(period)
 
     if link.armed:
@@ -591,6 +679,9 @@ def parse_args():
     p.add_argument("--kp-alt", type=float, default=KP_ALT, metavar="PER_S")
     p.add_argument("--kp-climb", type=float, default=KP_CLIMB, metavar="THR_PER_MPS")
     p.add_argument("--ki-climb", type=float, default=KI_CLIMB, metavar="THR_PER_M")
+    p.add_argument("--spool-start", type=float, default=SPOOL_START_THRUST,
+                   metavar="THR",
+                   help="open-loop ramp start; raise once hover is known")
     p.add_argument("--out", default=None, metavar="DIR")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -608,6 +699,11 @@ def main():
     log.info("gains kp_alt=%.3f kp_climb=%.3f ki_climb=%.3f "
              "baro_tau=%.2fs climb_tau=%.2fs",
              args.kp_alt, args.kp_climb, args.ki_climb, BARO_TAU_S, CLIMB_TAU_S)
+
+    if args.mode == "fly" and args.alt < 2.0:
+        log.warning("takeoff overshoot is about 0.7m regardless of target, so "
+                    "%.1fm means roughly %.0f%% overshoot -- 2.5m is a much "
+                    "cleaner test", args.alt, 100 * 0.7 / args.alt)
 
     if args.mode != "dry":
         log.warning("%s mode ARMS THE VEHICLE. Props off for bench. 5s to abort.",

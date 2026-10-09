@@ -129,6 +129,15 @@ def describe(d, run_dir):
             print("  climb error  RMS %.3f m/s   |max| %.3f m/s"
                   % (rms(d["climb_err_mps"]), max(abs(v) for v in d["climb_err_mps"])))
 
+        # At steady hover the P term averages out, so whatever the integral
+        # settled on IS the error in HOVER_THRUST. This is the only way to
+        # measure real hover thrust -- a props-off bench ramp cannot.
+        hover = phase_slice(d, "hover")
+        if hover and has("thrust_i"):
+            tail = [d["thrust_i"][i] for i in hover[len(hover) // 2:]]
+            print("  hover thrust implied %.3f  (HOVER_THRUST + %+.3f from the "
+                  "integral)" % (0.5 + st.mean(tail), st.mean(tail)))
+
     if "roll_deg" in d:
         print("-" * 70)
         print("ATTITUDE")
