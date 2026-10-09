@@ -1,6 +1,6 @@
 """Autonomous takeoff on IMU + barometer only, with no GPS, flow or rangefinder
 in the loop. Streams body-rate + thrust setpoints to PX4 OFFBOARD and closes
-altitude from raw SCALED_PRESSURE.
+altitude from low-passed SCALED_PRESSURE through a climb-rate cascade.
 
 Run: python3 baro_takeoff_test.py --mode dry
 """
@@ -24,7 +24,8 @@ LOOP_HZ = 20.0
 
 TARGET_ALT_M = 1.0
 HOVER_S = 10.0
-CLIMB_TIMEOUT_S = 15.0
+CLIMB_TIMEOUT_S = 20.0
+SETTLE_S = 1.0              # error must stay in tolerance this long to count
 
 HOVER_THRUST = 0.5          # MPC_THR_HOVER on this airframe
 THRUST_MIN = 0.0
@@ -33,9 +34,23 @@ BENCH_THRUST_MAX = 0.25     # props-off ceiling: enough to confirm mixer respons
 BENCH_RAMP_S = 4.0
 BENCH_HOLD_S = 3.0
 
-KP_ALT = 0.12               # thrust per metre of error, about hover
-KI_ALT = 0.04
-KD_ALT = 0.08
+# Filter time constants. Bench run 20261009_002835 measured raw baro at 0.101 m
+# 1-sigma, 0.59 m peak-to-peak, quantized to 0.01 hPa = 0.084 m per step.
+BARO_TAU_S = 0.30
+CLIMB_TAU_S = 0.10          # longer lag than this destabilizes the climb loop
+
+# Cascade: altitude error -> climb demand -> thrust. There is no derivative
+# term anywhere. Differentiating raw baro at 20 Hz measured 2.54 m/s of noise,
+# which at the old KD of 0.08 was 1.24 thrust peak-to-peak on a stationary
+# bench -- the full motor range, on sensor noise alone.
+# Gains swept in sim against the measured bench noise and a +/-10% hover-thrust
+# mismatch: settles in 3.7-6.4 s, peaks 1.11-1.24 m on a 1.0 m target, thrust
+# jitter 0.016-0.020 and never nearer than 0.09 to a limit.
+KP_ALT = 0.6                # 1/s: metres of error -> m/s of climb demand
+MAX_CLIMB_MPS = 0.3
+MAX_DESCENT_MPS = 0.3
+KP_CLIMB = 0.12             # thrust per m/s of climb error
+KI_CLIMB = 0.08             # thrust per m/s of climb error held for a second
 
 # Watchdog limits. Any trip disarms immediately.
 MAX_TILT_DEG = 20.0
@@ -49,8 +64,10 @@ BARO_SCALE_M = 44330.0
 BARO_EXP = 1.0 / 5.255
 
 CSV_HEADER = [
-    "t", "phase", "baro_alt_m", "press_hpa", "alt_err_m", "thrust",
-    "roll_deg", "pitch_deg", "yaw_deg",
+    "t", "phase", "alt_sp_m", "alt_raw_m", "alt_filt_m", "alt_err_m",
+    "climb_sp_mps", "climb_mps", "climb_err_mps",
+    "thrust", "thrust_p", "thrust_i",
+    "press_hpa", "roll_deg", "pitch_deg", "yaw_deg",
     "roll_rate_dps", "pitch_rate_dps", "yaw_rate_dps",
     "fused_alt_m", "rng_m", "mode", "armed",
 ]
@@ -71,27 +88,67 @@ def clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
 
 
-class AltPid:
-    """Altitude error in metres to a normalized thrust offset about hover."""
+class LowPass:
+    """Single-pole low-pass. Output lags a step input by about tau_s."""
 
-    def __init__(self, kp, ki, kd, out_min, out_max):
-        self.kp, self.ki, self.kd = kp, ki, kd
+    def __init__(self, tau_s, initial=0.0):
+        self.tau_s = tau_s
+        self.y = initial
+
+    def step(self, x, dt_s):
+        a = dt_s / (self.tau_s + dt_s)
+        self.y += a * (x - self.y)
+        return self.y
+
+
+class ClimbPi:
+    """Climb-rate error in m/s to a thrust offset about hover.
+
+    Deliberately PI with no D: the input is already a rate, so a derivative
+    would be differentiating the barometer twice.
+    """
+
+    def __init__(self, kp, ki, out_min, out_max):
+        self.kp, self.ki = kp, ki
         self.out_min, self.out_max = out_min, out_max
         self.integral = 0.0
-        self.prev_err = None
 
-    def step(self, err_m, dt_s):
-        deriv = 0.0 if self.prev_err is None else (err_m - self.prev_err) / dt_s
-        self.prev_err = err_m
-
-        raw = self.kp * err_m + self.ki * self.integral + self.kd * deriv
+    def step(self, err_mps, dt_s):
+        p = self.kp * err_mps
+        i = self.ki * self.integral
+        raw = p + i
         out = clamp(raw, self.out_min, self.out_max)
 
         # Only accumulate when the output has somewhere to go, or the integral
         # winds up against the ceiling and the loop never comes back down.
         if raw == out:
-            self.integral += err_m * dt_s
-        return out
+            self.integral += err_mps * dt_s
+        return out, p, i
+
+
+class AltEstimator:
+    """Raw pressure to filtered altitude and climb rate.
+
+    Climb rate differentiates the *filtered* altitude and low-passes the
+    result again, because consecutive raw samples differ mostly by one
+    quantization step rather than by real motion.
+    """
+
+    def __init__(self, ref_hpa, press_hpa):
+        self.ref_hpa = ref_hpa
+        self.alt_lp = LowPass(BARO_TAU_S, baro_alt_m(press_hpa, ref_hpa))
+        self.climb_lp = LowPass(CLIMB_TAU_S, 0.0)
+        self.prev_alt = self.alt_lp.y
+        self.raw = self.alt_lp.y
+        self.alt = self.alt_lp.y
+        self.climb = 0.0
+
+    def step(self, press_hpa, dt_s):
+        self.raw = baro_alt_m(press_hpa, self.ref_hpa)
+        self.alt = self.alt_lp.step(self.raw, dt_s)
+        self.climb = self.climb_lp.step((self.alt - self.prev_alt) / dt_s, dt_s)
+        self.prev_alt = self.alt
+        return self.alt, self.climb
 
 
 class Link:
@@ -294,13 +351,17 @@ class Recorder:
         self.csv.writerow(CSV_HEADER)
         self.t0 = time.monotonic()
 
-    def row(self, link, phase, alt_m, err_m, thrust):
+    def row(self, link, phase, alt_sp=0.0, alt_raw=0.0, alt_filt=0.0,
+            err_m=0.0, climb_sp=0.0, climb=0.0,
+            thrust=0.0, th_p=0.0, th_i=0.0):
         roll, pitch, yaw = link.attitude_deg
         roll_rate, pitch_rate, yaw_rate = link.rates_dps
         self.csv.writerow([
             "%.3f" % (time.monotonic() - self.t0), phase,
-            "%.3f" % alt_m, "%.2f" % (link.press_hpa or 0.0),
-            "%.3f" % err_m, "%.3f" % thrust,
+            "%.3f" % alt_sp, "%.3f" % alt_raw, "%.3f" % alt_filt, "%.3f" % err_m,
+            "%.3f" % climb_sp, "%.3f" % climb, "%.3f" % (climb_sp - climb),
+            "%.3f" % thrust, "%.3f" % th_p, "%.3f" % th_i,
+            "%.2f" % (link.press_hpa or 0.0),
             "%.2f" % roll, "%.2f" % pitch, "%.2f" % yaw,
             "%.2f" % roll_rate, "%.2f" % pitch_rate, "%.2f" % yaw_rate,
             "%.3f" % link.fused_alt_m, "%.3f" % link.rng_m,
@@ -312,7 +373,9 @@ class Recorder:
         self.fh.close()
 
 
-def check_watchdogs(link, alt_m, target_alt_m, elapsed_s):
+def check_watchdogs(link, alt_raw, target_alt_m, elapsed_s):
+    """Limits are checked against RAW altitude, so filter lag can never hide
+    a real runaway."""
     now = time.monotonic()
     roll, pitch, _ = link.attitude_deg
 
@@ -323,8 +386,8 @@ def check_watchdogs(link, alt_m, target_alt_m, elapsed_s):
     if max(abs(roll), abs(pitch)) > MAX_TILT_DEG:
         raise Fault("tilt %.1f deg exceeds %.1f" %
                     (max(abs(roll), abs(pitch)), MAX_TILT_DEG))
-    if alt_m > target_alt_m + ALT_OVERSHOOT_M:
-        raise Fault("altitude %.2fm overshot target %.2fm" % (alt_m, target_alt_m))
+    if alt_raw > target_alt_m + ALT_OVERSHOOT_M:
+        raise Fault("altitude %.2fm overshot target %.2fm" % (alt_raw, target_alt_m))
     if elapsed_s > RUN_TIMEOUT_S:
         raise Fault("run exceeded %.0fs" % RUN_TIMEOUT_S)
 
@@ -352,21 +415,37 @@ def take_reference(link, samples=20):
     return ref
 
 
-def run_dry(link, rec, args):
-    """Stream setpoints and engage OFFBOARD without ever arming."""
-    ref_hpa = take_reference(link)
+def engage_offboard(link, arm):
     link.set_rates(thrust=0.0)
     time.sleep(1.0)              # PX4 wants setpoints flowing before the mode request
-
     if not link.set_mode("OFFBOARD"):
         raise Fault("PX4 refused OFFBOARD")
+    if arm and not link.arm():
+        raise Fault("arm refused")
 
+
+def run_dry(link, rec, args):
+    """Stream setpoints and engage OFFBOARD without ever arming.
+
+    The filters run anyway, so a dry run on the bench characterizes the
+    barometer and shows what the altitude estimate would have looked like.
+    """
+    ref_hpa = take_reference(link)
+    engage_offboard(link, arm=False)
     log.info("OFFBOARD accepted while disarmed; holding %.0fs", args.dry_seconds)
-    deadline = time.monotonic() + args.dry_seconds
+
+    est = AltEstimator(ref_hpa, link.press_hpa)
     period = 1.0 / LOOP_HZ
-    while time.monotonic() < deadline:
-        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
-        rec.row(link, "dry", alt_m, 0.0, 0.0)
+    t_start = prev_t = time.monotonic()
+
+    while time.monotonic() - t_start < args.dry_seconds:
+        now = time.monotonic()
+        dt = max(now - prev_t, 1e-3)
+        prev_t = now
+
+        alt, climb = est.step(link.press_hpa, dt)
+        rec.row(link, "dry", alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
+                err_m=args.alt - alt, climb=climb)
         time.sleep(period)
 
     log.info("dry run complete, nothing was armed")
@@ -375,20 +454,18 @@ def run_dry(link, rec, args):
 def run_bench(link, rec, args):
     """Props-off thrust ramp under a hard ceiling. No altitude feedback."""
     ref_hpa = take_reference(link)
-    link.set_rates(thrust=0.0)
-    time.sleep(1.0)
+    engage_offboard(link, arm=True)
 
-    if not link.set_mode("OFFBOARD"):
-        raise Fault("PX4 refused OFFBOARD")
-    if not link.arm():
-        raise Fault("arm refused")
-
+    est = AltEstimator(ref_hpa, link.press_hpa)
     period = 1.0 / LOOP_HZ
-    t_start = time.monotonic()
     total_s = BENCH_RAMP_S + BENCH_HOLD_S + BENCH_RAMP_S
+    t_start = prev_t = time.monotonic()
 
     while True:
-        elapsed = time.monotonic() - t_start
+        now = time.monotonic()
+        dt = max(now - prev_t, 1e-3)
+        prev_t = now
+        elapsed = now - t_start
         if elapsed >= total_s:
             break
 
@@ -402,9 +479,10 @@ def run_bench(link, rec, args):
         thrust = BENCH_THRUST_MAX * frac
         link.set_rates(thrust=thrust)
 
-        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
-        check_watchdogs(link, alt_m, args.alt, elapsed)
-        rec.row(link, "bench", alt_m, 0.0, thrust)
+        alt, climb = est.step(link.press_hpa, dt)
+        check_watchdogs(link, est.raw, args.alt, elapsed)
+        rec.row(link, "bench", alt_raw=est.raw, alt_filt=alt, climb=climb,
+                thrust=thrust)
         time.sleep(period)
 
     link.set_rates(thrust=0.0)
@@ -413,45 +491,52 @@ def run_bench(link, rec, args):
 
 
 def run_fly(link, rec, args):
-    """Climb to target on the baro PID, hover, then hand off to AUTO.LAND."""
+    """Climb to target on the filtered baro cascade, hover, then AUTO.LAND."""
     ref_hpa = take_reference(link)
-    link.set_rates(thrust=0.0)
-    time.sleep(1.0)
+    engage_offboard(link, arm=True)
 
-    if not link.set_mode("OFFBOARD"):
-        raise Fault("PX4 refused OFFBOARD")
-    if not link.arm():
-        raise Fault("arm refused")
-
-    pid = AltPid(KP_ALT, KI_ALT, KD_ALT,
+    est = AltEstimator(ref_hpa, link.press_hpa)
+    pi = ClimbPi(args.kp_climb, args.ki_climb,
                  THRUST_MIN - HOVER_THRUST, THRUST_MAX - HOVER_THRUST)
+
     period = 1.0 / LOOP_HZ
-    t_start = time.monotonic()
+    t_start = prev_t = time.monotonic()
+    t_in_band = None
     t_reached = None
-    prev_t = t_start
 
     while True:
         now = time.monotonic()
-        dt = now - prev_t
+        dt = max(now - prev_t, 1e-3)
         prev_t = now
         elapsed = now - t_start
 
-        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
-        err_m = args.alt - alt_m
-        check_watchdogs(link, alt_m, args.alt, elapsed)
+        alt, climb = est.step(link.press_hpa, dt)
+        check_watchdogs(link, est.raw, args.alt, elapsed)
 
-        thrust = HOVER_THRUST + pid.step(err_m, max(dt, 1e-3))
+        err_m = args.alt - alt
+        climb_sp = clamp(args.kp_alt * err_m, -MAX_DESCENT_MPS, MAX_CLIMB_MPS)
+        offset, th_p, th_i = pi.step(climb_sp - climb, dt)
+        thrust = HOVER_THRUST + offset
         link.set_rates(thrust=thrust)
 
         phase = "climb" if t_reached is None else "hover"
-        rec.row(link, phase, alt_m, err_m, thrust)
+        rec.row(link, phase, alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
+                err_m=err_m, climb_sp=climb_sp, climb=climb,
+                thrust=thrust, th_p=th_p, th_i=th_i)
 
         if t_reached is None:
-            if abs(err_m) < args.alt_tol:
+            # Require the error to STAY in tolerance, or baro noise alone
+            # declares the climb finished on a single lucky sample.
+            if abs(err_m) > args.alt_tol:
+                t_in_band = None
+            elif t_in_band is None:
+                t_in_band = now
+            elif now - t_in_band >= SETTLE_S:
                 t_reached = now
-                log.info("STATE -> hover at %.2fm after %.1fs", alt_m, elapsed)
-            elif elapsed > CLIMB_TIMEOUT_S:
-                raise Fault("climb to %.2fm timed out at %.2fm" % (args.alt, alt_m))
+                log.info("STATE -> hover at %.2fm after %.1fs", alt, elapsed)
+
+            if t_reached is None and elapsed > CLIMB_TIMEOUT_S:
+                raise Fault("climb to %.2fm timed out at %.2fm" % (args.alt, alt))
         elif now - t_reached >= args.hover:
             break
 
@@ -463,8 +548,12 @@ def run_fly(link, rec, args):
 
     deadline = time.monotonic() + 30.0
     while link.armed and time.monotonic() < deadline:
-        alt_m = baro_alt_m(link.press_hpa, ref_hpa)
-        rec.row(link, "land", alt_m, 0.0, 0.0)
+        now = time.monotonic()
+        dt = max(now - prev_t, 1e-3)
+        prev_t = now
+        alt, climb = est.step(link.press_hpa, dt)
+        rec.row(link, "land", alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
+                climb=climb)
         time.sleep(period)
 
     if link.armed:
@@ -496,9 +585,12 @@ def parse_args():
                         "ramp. fly: closed-loop takeoff.")
     p.add_argument("--conn", default=CONN)
     p.add_argument("--alt", type=float, default=TARGET_ALT_M, metavar="M")
-    p.add_argument("--alt-tol", type=float, default=0.30, metavar="M")
+    p.add_argument("--alt-tol", type=float, default=0.15, metavar="M")
     p.add_argument("--hover", type=float, default=HOVER_S, metavar="S")
     p.add_argument("--dry-seconds", type=float, default=15.0, metavar="S")
+    p.add_argument("--kp-alt", type=float, default=KP_ALT, metavar="PER_S")
+    p.add_argument("--kp-climb", type=float, default=KP_CLIMB, metavar="THR_PER_MPS")
+    p.add_argument("--ki-climb", type=float, default=KI_CLIMB, metavar="THR_PER_M")
     p.add_argument("--out", default=None, metavar="DIR")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -513,6 +605,9 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     setup_logging(run_dir, args.verbose)
     log.info("mode=%s alt=%.2fm run_dir=%s", args.mode, args.alt, run_dir)
+    log.info("gains kp_alt=%.3f kp_climb=%.3f ki_climb=%.3f "
+             "baro_tau=%.2fs climb_tau=%.2fs",
+             args.kp_alt, args.kp_climb, args.ki_climb, BARO_TAU_S, CLIMB_TAU_S)
 
     if args.mode != "dry":
         log.warning("%s mode ARMS THE VEHICLE. Props off for bench. 5s to abort.",
