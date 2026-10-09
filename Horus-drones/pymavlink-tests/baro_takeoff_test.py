@@ -27,7 +27,12 @@ HOVER_S = 10.0
 CLIMB_TIMEOUT_S = 20.0
 SETTLE_S = 1.0              # error must stay in tolerance this long to count
 
-HOVER_THRUST = 0.5          # MPC_THR_HOVER on this airframe
+# Measured from .ulg hover segments: 0.339 (log_226), 0.360 (log_225),
+# 0.335 (log_70), ~25k steady samples. MPC_THR_HOVER on the FC still says 0.5,
+# which is the untouched PX4 default and wrong. Only a fallback now -- the
+# spool-up measures the real value every flight, and it drifts up with battery
+# sag (0.32 fresh to 0.35 after ten minutes).
+HOVER_THRUST = 0.34
 THRUST_MIN = 0.0
 THRUST_MAX = 0.70
 BENCH_THRUST_MAX = 0.25     # props-off ceiling: enough to confirm mixer response
@@ -60,20 +65,24 @@ KI_CLIMB = 0.08             # thrust per m/s of climb error held for a second
 SPOOL_START_THRUST = 0.20
 SPOOL_RATE_PER_S = 0.03     # slow: the measured hover is biased high by
                             # roughly rate * the 1.0s detection lag
-SPOOL_THRUST_MAX = 0.75     # hard ceiling on the open-loop ramp
+SPOOL_THRUST_MAX = 0.55     # hard ceiling on the open-loop ramp; measured
+                            # liftoff is 0.25-0.31, so this is ample
 SPOOL_TIMEOUT_S = 25.0
 SPOOL_BASELINE_S = 1.0      # average the ground altitude before ramping
 LIFTOFF_RISE_M = 0.15       # about 3.3 sigma on filtered altitude
 LIFTOFF_HOLD_S = 0.4
 LIFTOFF_MARGIN = 0.03       # SPOOL_RATE_PER_S * detection lag
 
-# Thrust authority allowed either side of the MEASURED hover point. This is the
-# safety property that matters: baro liftoff detection is ~1 s late, so the
-# aircraft is already climbing at over 1 m/s at handover. Without a band this
-# airframe (T/W 5-9) overshoots past ALT_OVERSHOOT_M and the watchdog disarms
-# it in the air. +0.06 caps upward acceleration near 0.12 g.
-THRUST_BAND_UP = 0.06
-THRUST_BAND_DN = 0.10
+# Thrust authority allowed either side of the MEASURED hover point, as a
+# FRACTION of it. This is the safety property that matters: baro liftoff
+# detection is ~1 s late, so the aircraft is already climbing at over 1 m/s at
+# handover, and without a band it overshoots past ALT_OVERSHOOT_M and the
+# watchdog disarms it in the air. Fractions, not absolutes, because the logs
+# put hover near 0.34 rather than 0.5 -- the same absolute band is twice the
+# acceleration there. 6% caps the climb near 0.12 g even if thrust turns out
+# quadratic in command.
+THRUST_BAND_UP_FRAC = 0.06
+THRUST_BAND_DN_FRAC = 0.10
 
 # Watchdog limits. Any trip disarms immediately.
 MAX_TILT_DEG = 20.0
@@ -81,6 +90,8 @@ ALT_OVERSHOOT_M = 1.5       # above target before we call it a runaway
 BARO_STALE_S = 0.5
 ATT_STALE_S = 0.5
 RUN_TIMEOUT_S = 90.0
+MIN_FLY_ALT_M = 2.0         # below this the target is smaller than the
+                            # unavoidable takeoff transient; see --force-low-alt
 
 # h = 44330 * (1 - (p/p0) ** (1/5.255)), the ISA barometric formula.
 BARO_SCALE_M = 44330.0
@@ -585,7 +596,8 @@ def run_fly(link, rec, args):
     est = AltEstimator(ref_hpa, link.press_hpa)
     hover_ff = spool_to_liftoff(link, rec, est, args)
     pi = ClimbPi(args.kp_climb, args.ki_climb,
-                 -THRUST_BAND_DN, THRUST_BAND_UP)
+                 -THRUST_BAND_DN_FRAC * hover_ff,
+                 THRUST_BAND_UP_FRAC * hover_ff)
 
     period = 1.0 / LOOP_HZ
     t_start = prev_t = time.monotonic()
@@ -683,6 +695,9 @@ def parse_args():
                    metavar="THR",
                    help="open-loop ramp start; raise once hover is known")
     p.add_argument("--out", default=None, metavar="DIR")
+    p.add_argument("--force-low-alt", action="store_true",
+                   help="allow --mode fly below %.1fm (overshoot may trip the "
+                        "watchdog in flight)" % MIN_FLY_ALT_M)
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -700,10 +715,15 @@ def main():
              "baro_tau=%.2fs climb_tau=%.2fs",
              args.kp_alt, args.kp_climb, args.ki_climb, BARO_TAU_S, CLIMB_TAU_S)
 
-    if args.mode == "fly" and args.alt < 2.0:
-        log.warning("takeoff overshoot is about 0.7m regardless of target, so "
-                    "%.1fm means roughly %.0f%% overshoot -- 2.5m is a much "
-                    "cleaner test", args.alt, 100 * 0.7 / args.alt)
+    if args.mode == "fly" and args.alt < MIN_FLY_ALT_M and not args.force_low_alt:
+        raise SystemExit(
+            "Refusing --mode fly below %.1fm.\n"
+            "Takeoff overshoot is about 0.7m whatever the target, because baro\n"
+            "liftoff detection is ~1s late and the aircraft is already climbing\n"
+            "at over 1 m/s at handover. In sim, %.1fm trips the %.1fm overshoot\n"
+            "watchdog and force-disarms in the air; 2.5m does not.\n"
+            "Use --alt 2.5, or --force-low-alt if you accept that risk."
+            % (MIN_FLY_ALT_M, args.alt, ALT_OVERSHOOT_M))
 
     if args.mode != "dry":
         log.warning("%s mode ARMS THE VEHICLE. Props off for bench. 5s to abort.",
