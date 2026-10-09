@@ -5,7 +5,7 @@ altitude from low-passed SCALED_PRESSURE through a climb-rate cascade.
 It does not land. After the hover it holds and waits for the pilot to take over
 on the transmitter, and it never disarms once the vehicle has left OFFBOARD.
 
-Run: python3 baro_takeoff_test.py --mode dry
+Run: python3 baro_takeoff_test.py --alt 2.5
 """
 
 import argparse
@@ -18,202 +18,81 @@ import time
 
 from pymavlink import mavutil
 
-# TUNING MAP -- which knob for which symptom.
+# TUNING MAP -- symptom to knob.
+#   won't leave the ground ..... --hover-ff up, then HOVER_FF_MAX
+#   leaps off violently ........ --hover-ff and SPOOL_START_THRUST down
+#   overshoots the target ...... KP_ALT or MAX_CLIMB_MPS down
+#   motors buzzing ............. BARO_TAU_S up, or KP_CLIMB down
+#   holds the wrong altitude ... KI_CLIMB up
+#   hovers too low ............. --climb-s up
+#   disarms mid-climb .......... ALT_OVERSHOOT_M up
 #
-#   won't leave the ground ........ raise --hover-ff (or HOVER_THRUST), then
-#                                   HOVER_FF_MAX, then FF_ESCAPE_RATE
-#   leaps off violently ........... lower --hover-ff and SPOOL_START_THRUST
-#   climbs then overshoots badly .. lower KP_ALT or MAX_CLIMB_MPS
-#   motors buzzing / twitchy ...... raise BARO_TAU_S, or lower KP_CLIMB
-#   never settles, wanders ........ raise KI_CLIMB
-#   not high enough before hover ... raise --climb-s
-#   disarms itself mid-climb ...... raise ALT_OVERSHOOT_M (nothing else
-#                                   disarms on altitude any more)
-#
-# Everything below is a module default. The ones you will actually iterate on
-# have CLI flags: --alt --climb-s --hover --hover-ff --kp-alt --kp-climb
-# --ki-climb. Prefer the flags; keep the file as the known-good baseline.
+# Flags for what you iterate on: --alt --climb-s --hover --hover-ff --kp-alt
+# --kp-climb --ki-climb. Keep this file as the known-good baseline.
 
-CONN = "udpout:127.0.0.1:14551"
-# Where mavp2p hands MAVLink to companion scripts. Not the FC directly -- the
-# FC is on /dev/serial0 and mavp2p fans it out to here and to the GCS.
+CONN = "udpout:127.0.0.1:14551"   # mavp2p's companion endpoint, not the FC
+SOURCE_SYSTEM = 255               # our MAVLink id; must differ from the FC's 3
 
-SOURCE_SYSTEM = 255
-# Our MAVLink system id. 255 is the conventional ground-station id. Must differ
-# from the FC's (3) or routing gets confused about who is who.
+STREAM_HZ = 20.0            # setpoint resend; under 1 Hz PX4 drops offboard
+HEARTBEAT_HZ = 1.0          # mavp2p won't route to an endpoint it hasn't heard
+LOOP_HZ = 20.0              # control rate; 19.8 Hz measured on the Pi Zero 2 W
 
-STREAM_HZ = 20.0
-# How often the setpoint thread resends SET_ATTITUDE_TARGET. Must stay well
-# above 1/COM_OF_LOSS_T (= 1 Hz) or PX4 declares offboard lost and drops the
-# mode mid-flight. Higher is free apart from CPU; below ~5 Hz feels steppy.
+TARGET_ALT_M = 2.5          # --alt
+CLIMB_S = 10.0              # --climb-s: seconds climbing before the hover timer
+HOVER_S = 10.0              # --hover: hold at target, then wait for the pilot
 
-HEARTBEAT_HZ = 1.0
-# Our heartbeat out to mavp2p. mavp2p will not route anything back to an
-# endpoint it has never heard from, so this has to keep running, not just fire
-# once at connect.
-
-LOOP_HZ = 20.0
-# Control loop rate. Separate from STREAM_HZ: the loop decides thrust, the
-# stream thread repeats whatever the loop last set. Measured 19.8 Hz actual
-# with 0.6 ms jitter on the Pi Zero 2 W, so 20 is sustainable.
-
-TARGET_ALT_M = 1.0
-# Default hover target. Override with --alt. Note --mode fly refuses anything
-# below MIN_FLY_ALT_M; 2.5 m is the tested value.
-
-HOVER_S = 10.0
-# How long to hold the target before handing over to the pilot. Override with
-# --hover. The script never lands; it holds until you take the TX.
-
-CLIMB_S = 10.0
-# How long to spend climbing before the hover timer starts, measured from the
-# end of the feedforward ramp. Purely time-based: there is no altitude test.
-# Baro wanders 0.787 m over 25 s, so any "are we there yet" check on altitude
-# either misfires or never fires, and the climb estimate is far too noisy to
-# help. 2.5 m at MAX_CLIMB_MPS 0.3 needs about 8 s, so 12 leaves margin.
-# Nothing here disarms: if the aircraft is low when the timer expires, it holds
-# and hands over to you. Override with --climb-s.
-
-# Hover thrust measured from .ulg hover segments: 0.339 (log_226), 0.360
-# (log_225), 0.335 (log_70), ~25k steady samples, corroborated by PX4's own
-# hover_thrust_estimate (0.322-0.346). MPC_THR_HOVER on the FC says 0.5, which
-# is the untouched PX4 default and wrong. Hover also drifts up with battery sag
-# (0.32 fresh to 0.35 after ten minutes), which the FF_ESCAPE hunt absorbs.
-#
-# CAVEAT: those logs may be a lighter build than the current caged airframe.
-# If 0.5 lifts instantly and 0.36 will not lift at all, real hover for THIS
-# build is between -- raise this (or pass --hover-ff) until the ramp just lifts.
+# Hover thrust measured from three .ulg flights (0.339 / 0.360 / 0.335, ~25k
+# steady samples) and PX4's own hover_thrust_estimate (0.322-0.346). The FC's
+# MPC_THR_HOVER still says 0.5, which is the untouched default and wrong.
+# Those logs may be a lighter build than the caged airframe -- if it will not
+# lift, raise this or pass --hover-ff.
 HOVER_THRUST = 0.34
+THRUST_MIN = 0.0            # absolute clamp on the wire, not a tuning knob
+THRUST_MAX = 0.70           # ~2x hover, so not what limits takeoff
 
-THRUST_MIN = 0.0
-THRUST_MAX = 0.70
-# Absolute floor and ceiling on anything we put on the wire, after all bands
-# and hunts. A last-resort clamp, not a tuning knob. THRUST_MAX 0.70 is about
-# twice the measured hover command, so it is not what limits takeoff.
+# Raw baro: 0.101 m 1-sigma, 0.59 m peak-to-peak, 0.084 m per 0.01 hPa step,
+# and the FC's own baro wandered 0.787 m over 25 s.
+BARO_TAU_S = 0.30           # altitude low-pass; up = quieter but more lag
+CLIMB_TAU_S = 0.10          # climb low-pass; keep short, 0.50 never settled
 
-BENCH_THRUST_MAX = 0.25
-# Props-off ceiling for --mode bench. Enough to confirm the mixer responds and
-# all four motors spin. NOT enough to lift: measured liftoff is 0.25-0.31, so
-# this sits right at the bottom of that. Raise it only with props off.
-
-BENCH_RAMP_S = 4.0
-BENCH_HOLD_S = 3.0
-# Bench ramp shape: ramp up over RAMP, hold at the ceiling for HOLD, ramp down.
-
-# Filter time constants. Raw baro measured 0.101 m 1-sigma, 0.59 m
-# peak-to-peak, quantized to 0.01 hPa = 0.084 m per step, and the FC's own baro
-# wandered 0.787 m over 25 s.
-BARO_TAU_S = 0.30
-# Low-pass on altitude. Raise it for a quieter altitude signal and less thrust
-# buzz, at the cost of lag -- and lag is what causes takeoff overshoot. 0.30
-# takes 0.101 m of noise down to 0.046 m.
-
-CLIMB_TAU_S = 0.10
-# Low-pass on the climb-rate estimate, which is the differentiated filtered
-# altitude. Keep it SHORT. At 0.50 the loop never settled in sim (rang +/-0.66
-# m); 0.10 was the best of 0.10/0.15/0.25. The cost of short is noise: the
-# climb estimate carries +/-0.44 m/s standing still, so never use climb_mps for
-# a threshold decision anywhere.
-
-# The cascade: altitude error -> climb demand -> thrust offset. There is no
-# derivative term anywhere by design. Differentiating raw baro at 20 Hz
-# measured 2.54 m/s of noise, which at an old KD of 0.08 was 1.24 thrust
-# peak-to-peak on a stationary bench -- the entire motor range, on noise alone.
-KP_ALT = 0.6
-# Outer loop, units 1/s: metres of altitude error -> m/s of climb demanded.
-# 0.6 means 1 m low asks for 0.6 m/s up, clipped by MAX_CLIMB_MPS. Raise for a
-# faster climb and more overshoot; lower for slower and gentler.
-
-MAX_CLIMB_MPS = 0.3
+# Cascade: altitude error -> climb demand -> thrust. No derivative term
+# anywhere -- differentiating raw baro measured 2.54 m/s of noise, which at an
+# old KD of 0.08 swung thrust 1.24 peak-to-peak on a stationary bench.
+KP_ALT = 0.6                # 1/s: metres of error -> m/s of climb demanded
+MAX_CLIMB_MPS = 0.3         # clip on that demand; the main overshoot control
 MAX_DESCENT_MPS = 0.3
-# Hard clip on the climb demand either way. This is the main overshoot control:
-# the aircraft cannot be asked to climb faster than this no matter how far off
-# target it is. Lower it to tame overshoot, raise it to reach altitude sooner.
+KP_CLIMB = 0.12             # thrust per m/s of climb error
+KI_CLIMB = 0.08             # trims a wrong feedforward and battery sag
 
-KP_CLIMB = 0.12
-# Inner loop: thrust offset per m/s of climb-rate error. Raise for a stiffer
-# response to climb error; too high and the climb-estimate noise (+/-0.44 m/s)
-# turns into visible thrust buzz. 0.12 gives about 0.0165 thrust at 1 sigma.
-
-KI_CLIMB = 0.08
-# Integral on climb error: thrust per (m/s held for one second). This is what
-# trims out a wrong feedforward and battery sag. Raise it if the aircraft holds
-# steady but at the wrong altitude; too high and it hunts.
-
-# Takeoff feedforward. There is deliberately NO baro liftoff detection: run
-# 024807 proved it unusable. The FC's baro wandered 0.787 m over 25 s against a
-# 0.15 m detection threshold, so it declared liftoff at thrust 0.259 while the
-# aircraft sat on the ground, and the authority band then pinned thrust at
-# 0.243 -- below hover -- and it could never recover.
-#
-# Instead the feedforward ramps to a known-good value with the loop live the
-# whole time, and then hunts if it turns out wrong in either direction.
-SPOOL_START_THRUST = 0.20
-# Where the feedforward ramp begins. Keep it BELOW hover so the aircraft does
-# not jump. At 0.5 (above the ~0.34 hover) it leaves the ground instantly --
-# that is this constant being set past hover, not a fault.
-
-FF_RAMP_S = 4.0
-# Seconds to ramp the feedforward from SPOOL_START_THRUST up to --hover-ff.
-# Longer is gentler at liftoff; shorter gets airborne sooner. The loop is
-# already closed during the ramp, so this is a launch-smoothness knob.
-
-FF_ESCAPE_RATE = 0.02
-# How fast the feedforward hunts when it turns out wrong, in thrust per second.
-# Walking 0.34 -> 0.45 takes 5.5 s at this rate, which has to fit inside
-# CLIMB_S. Raise it if the aircraft sits on the ground straining.
-
-FF_ESCAPE_DUTY = 0.8
-FF_DUTY_TAU_S = 1.0
-# The hunt triggers on a saturation DUTY CYCLE, not an instantaneous test:
-# "output has been pinned at the band edge for 80% of the last second". A
-# duty cycle because the climb estimate is far too noisy for any "is it moving
-# right now" check -- that exact mistake caused two separate bugs already.
-
+# No baro liftoff detection: run 024807 declared liftoff at 0.259 while sitting
+# on the ground, because 0.787 m of baro wander dwarfs any threshold. Instead
+# the feedforward ramps to a known-good value with the loop live, then hunts if
+# that value turns out wrong in either direction.
+SPOOL_START_THRUST = 0.20   # ramp start; keep BELOW hover or it jumps
+FF_RAMP_S = 4.0             # seconds to ramp up to --hover-ff
+FF_ESCAPE_RATE = 0.02       # thrust/s the hunt moves when saturated
+FF_ESCAPE_DUTY = 0.8        # hunt after this fraction of a second pinned...
+FF_DUTY_TAU_S = 1.0         # ...a duty cycle, because climb is far too noisy
 HOVER_FF_MIN = 0.20
-HOVER_FF_MAX = 0.45
-# Bounds on the hunt. If the aircraft will not lift and the log shows the
-# feedforward parked at HOVER_FF_MAX, raise this ceiling -- real hover for this
-# build is above it. Keep MIN below any plausible hover so descent stays
-# possible.
+HOVER_FF_MAX = 0.45         # raise if the log parks the feedforward here
 
+# Thrust the PI may add either side of the feedforward, as a FRACTION of it --
+# hover is near 0.34, so a fixed band would be twice the acceleration there.
+# 6% caps the climb near 0.12 g. This band is what locked the aircraft down in
+# run 024807; it is only safe because FF_ESCAPE can move the feedforward.
 THRUST_BAND_UP_FRAC = 0.06
 THRUST_BAND_DN_FRAC = 0.10
-# Thrust authority the PI gets either side of the feedforward, as a FRACTION of
-# it (6% of 0.34 is 0.020). Fractions rather than absolutes because hover is
-# near 0.34, not 0.5, and the same absolute band is twice the acceleration
-# there. 6% caps the climb near 0.12 g even if thrust is quadratic in command.
-#
-# This is the band that locked the aircraft down in run 024807 when the
-# feedforward was wrong. It is safe now only because FF_ESCAPE can move the
-# feedforward. Widen UP for more climb authority and more overshoot risk.
 
-# Watchdogs. Any trip disarms immediately -- which in the air means it drops,
-# so these are deliberately loose enough not to fire on noise.
-MAX_TILT_DEG = 20.0
-# Roll or pitch beyond this is a tumble, not a hover. On-ground noise is 0.02
-# deg, so there is enormous margin.
+# Watchdogs. A trip disarms, which in the air means it drops, so these are
+# deliberately loose enough never to fire on noise.
+MAX_TILT_DEG = 20.0         # on-ground attitude noise is 0.02 deg
+ALT_OVERSHOOT_M = 1.5       # above target = runaway; checked on RAW altitude
+BARO_STALE_S = 0.5          # baro normally arrives at 25 Hz
+ATT_STALE_S = 0.5           # attitude at 50 Hz
+RUN_TIMEOUT_S = 90.0        # climb only; disabled during the pilot handover
+MIN_FLY_ALT_M = 2.0         # takeoff overshoot is ~0.7 m whatever the target
 
-ALT_OVERSHOOT_M = 1.5
-# Metres above target before we call it a runaway. Checked against RAW
-# altitude, never filtered, so filter lag cannot hide a real climb. Takeoff
-# overshoot is about 0.7 m intrinsically, so do not set this below ~1.0.
-
-BARO_STALE_S = 0.5
-ATT_STALE_S = 0.5
-# Lose either telemetry stream for this long and stop. Both normally arrive at
-# 25 Hz and 50 Hz, so 0.5 s is many missed messages, not one.
-
-RUN_TIMEOUT_S = 90.0
-# Wall-clock limit on the climb. Disabled during the pilot-handover hold, where
-# it would otherwise disarm the aircraft out from under you.
-
-MIN_FLY_ALT_M = 2.0
-# --mode fly refuses below this without --force-low-alt. Takeoff overshoot is
-# about 0.7 m whatever the target, so a 1 m target is 74% overshoot and tripped
-# ALT_OVERSHOOT_M in 3 of 12 sim cases; 2.5 m tripped none.
-
-# h = 44330 * (1 - (p/p0) ** (1/5.255)), the ISA barometric formula. Not knobs.
+# h = 44330 * (1 - (p/p0) ** (1/5.255)), the ISA barometric formula.
 BARO_SCALE_M = 44330.0
 BARO_EXP = 1.0 / 5.255
 
@@ -283,6 +162,37 @@ class ClimbPi:
         if raw == out:
             self.integral += err_mps * dt_s
         return out, p, i
+
+
+class FeedforwardHunt:
+    """Moves the hover feedforward when the PI sits pinned at a band edge.
+
+    Triggers on a saturation DUTY CYCLE, never an instantaneous test: the climb
+    estimate carries +/-0.44 m/s of noise standing still, so any "is it moving
+    right now" check flickers and never latches. That mistake caused two
+    separate bugs before this existed.
+    """
+
+    def __init__(self):
+        self.hi = LowPass(FF_DUTY_TAU_S, 0.0)
+        self.lo = LowPass(FF_DUTY_TAU_S, 0.0)
+
+    def update(self, hover_ff, pi, offset, err_m, dt_s):
+        """Pinned high while still low means too little feedforward, and the
+        reverse means too much. Returns the adjusted value."""
+        hi = self.hi.step(1.0 if offset >= pi.out_max - 1e-6 else 0.0, dt_s)
+        lo = self.lo.step(1.0 if offset <= pi.out_min + 1e-6 else 0.0, dt_s)
+
+        if hi > FF_ESCAPE_DUTY and err_m > 0:
+            moved = min(hover_ff + FF_ESCAPE_RATE * dt_s, HOVER_FF_MAX)
+        elif lo > FF_ESCAPE_DUTY and err_m < 0:
+            moved = max(hover_ff - FF_ESCAPE_RATE * dt_s, HOVER_FF_MIN)
+        else:
+            return hover_ff
+
+        if int(moved * 100) != int(hover_ff * 100):
+            log.info("feedforward -> %.3f", moved)
+        return moved
 
 
 class AltEstimator:
@@ -579,98 +489,48 @@ def take_reference(link, samples=20):
     return ref
 
 
-def engage_offboard(link, arm):
+def engage_offboard(link):
     link.set_rates(thrust=0.0)
     time.sleep(1.0)              # PX4 wants setpoints flowing before the mode request
     if not link.set_mode("OFFBOARD"):
         raise Fault("PX4 refused OFFBOARD")
-    if arm and not link.arm():
+    if not link.arm():
         raise Fault("arm refused")
 
 
-def run_dry(link, rec, args):
-    """Stream setpoints and engage OFFBOARD without ever arming.
+def control_step(link, rec, est, pi, args, hover_ff, phase, dt_s):
+    """One control pass: read the baro, command thrust, log the row."""
+    alt, climb = est.step(link.press_hpa, dt_s)
 
-    The filters run anyway, so a dry run on the bench characterizes the
-    barometer and shows what the altitude estimate would have looked like.
+    # The band is a fraction of the feedforward, so it moves when that does.
+    pi.out_max = THRUST_BAND_UP_FRAC * hover_ff
+    pi.out_min = -THRUST_BAND_DN_FRAC * hover_ff
+
+    err_m = args.alt - alt
+    climb_sp = clamp(args.kp_alt * err_m, -MAX_DESCENT_MPS, MAX_CLIMB_MPS)
+    offset, th_p, th_i = pi.step(climb_sp - climb, dt_s)
+    link.set_rates(thrust=hover_ff + offset)
+
+    rec.row(link, phase, alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
+            err_m=err_m, climb_sp=climb_sp, climb=climb,
+            thrust=hover_ff + offset, th_p=th_p, th_i=th_i, hover_ff=hover_ff)
+    return alt, err_m, offset
+
+
+def climb_and_hover(link, rec, est, pi, args):
+    """Ramp the feedforward in, climb for --climb-s, hold for --hover.
+
+    Returns whatever feedforward the hunt settled on, which is the useful
+    measurement from the flight.
     """
-    ref_hpa = take_reference(link)
-    engage_offboard(link, arm=False)
-    log.info("OFFBOARD accepted while disarmed; holding %.0fs", args.dry_seconds)
-
-    est = AltEstimator(ref_hpa, link.press_hpa)
-    period = 1.0 / LOOP_HZ
-    t_start = prev_t = time.monotonic()
-
-    while time.monotonic() - t_start < args.dry_seconds:
-        now = time.monotonic()
-        dt = max(now - prev_t, 1e-3)
-        prev_t = now
-
-        alt, climb = est.step(link.press_hpa, dt)
-        rec.row(link, "dry", alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
-                err_m=args.alt - alt, climb=climb)
-        time.sleep(period)
-
-    log.info("dry run complete, nothing was armed")
-
-
-def run_bench(link, rec, args):
-    """Props-off thrust ramp under a hard ceiling. No altitude feedback."""
-    ref_hpa = take_reference(link)
-    engage_offboard(link, arm=True)
-
-    est = AltEstimator(ref_hpa, link.press_hpa)
-    period = 1.0 / LOOP_HZ
-    total_s = BENCH_RAMP_S + BENCH_HOLD_S + BENCH_RAMP_S
-    t_start = prev_t = time.monotonic()
-
-    while True:
-        now = time.monotonic()
-        dt = max(now - prev_t, 1e-3)
-        prev_t = now
-        elapsed = now - t_start
-        if elapsed >= total_s:
-            break
-
-        if elapsed < BENCH_RAMP_S:
-            frac = elapsed / BENCH_RAMP_S
-        elif elapsed < BENCH_RAMP_S + BENCH_HOLD_S:
-            frac = 1.0
-        else:
-            frac = 1.0 - (elapsed - BENCH_RAMP_S - BENCH_HOLD_S) / BENCH_RAMP_S
-
-        thrust = BENCH_THRUST_MAX * frac
-        link.set_rates(thrust=thrust)
-
-        alt, climb = est.step(link.press_hpa, dt)
-        check_watchdogs(link, est.raw, args.alt, elapsed)
-        rec.row(link, "bench", alt_raw=est.raw, alt_filt=alt, climb=climb,
-                thrust=thrust)
-        time.sleep(period)
-
-    link.set_rates(thrust=0.0)
-    link.disarm()
-    log.info("bench ramp complete, peak thrust %.2f", BENCH_THRUST_MAX)
-
-
-def run_fly(link, rec, args):
-    """Ramp the feedforward to hover, climb, hold, then hand to the pilot."""
-    ref_hpa = take_reference(link)
-    engage_offboard(link, arm=True)
-
-    est = AltEstimator(ref_hpa, link.press_hpa)
-    pi = ClimbPi(args.kp_climb, args.ki_climb, 0.0, 0.0)
     hover_ff = SPOOL_START_THRUST
-    sat_hi = LowPass(FF_DUTY_TAU_S, 0.0)
-    sat_lo = LowPass(FF_DUTY_TAU_S, 0.0)
-    log.info("feedforward %.3f -> %.3f over %.1fs, escape ceiling %.3f",
-             SPOOL_START_THRUST, args.hover_ff, FF_RAMP_S, HOVER_FF_MAX)
-
+    hunt = FeedforwardHunt()
+    climb_until = FF_RAMP_S + args.climb_s
     period = 1.0 / LOOP_HZ
     t_start = prev_t = time.monotonic()
-    climb_until = FF_RAMP_S + args.climb_s
     t_reached = None
+    log.info("feedforward %.3f -> %.3f over %.1fs, hunt ceiling %.3f",
+             SPOOL_START_THRUST, args.hover_ff, FF_RAMP_S, HOVER_FF_MAX)
 
     while True:
         now = time.monotonic()
@@ -681,49 +541,21 @@ def run_fly(link, rec, args):
         if not link.in_offboard:
             raise PilotControl("vehicle left OFFBOARD (now %s)" % link.mode_name)
 
-        alt, climb = est.step(link.press_hpa, dt)
-        check_watchdogs(link, est.raw, args.alt, elapsed,
-                        timeout=t_reached is None)
-
         if elapsed < FF_RAMP_S:
             hover_ff = (SPOOL_START_THRUST
                         + (args.hover_ff - SPOOL_START_THRUST) * elapsed / FF_RAMP_S)
 
-        # The band is a fraction of the feedforward, so it has to be recomputed
-        # as the feedforward moves.
-        pi.out_max = THRUST_BAND_UP_FRAC * hover_ff
-        pi.out_min = -THRUST_BAND_DN_FRAC * hover_ff
-
-        err_m = args.alt - alt
-        climb_sp = clamp(args.kp_alt * err_m, -MAX_DESCENT_MPS, MAX_CLIMB_MPS)
-        offset, th_p, th_i = pi.step(climb_sp - climb, dt)
-        thrust = hover_ff + offset
-        link.set_rates(thrust=thrust)
-
-        # Self-correct the feedforward. Measured as a DUTY CYCLE, not an
-        # instantaneous test: the climb estimate carries +/-0.44 m/s of noise,
-        # so any "is it moving right now" check flickers and never latches.
-        # Sitting at the top of the band while still low means the feedforward
-        # is too small; the bottom while still high means it is too big.
-        hi = sat_hi.step(1.0 if offset >= pi.out_max - 1e-6 else 0.0, dt)
-        lo = sat_lo.step(1.0 if offset <= pi.out_min + 1e-6 else 0.0, dt)
-        before = hover_ff
-        if hi > FF_ESCAPE_DUTY and err_m > 0:
-            hover_ff = min(hover_ff + FF_ESCAPE_RATE * dt, HOVER_FF_MAX)
-        elif lo > FF_ESCAPE_DUTY and err_m < 0:
-            hover_ff = max(hover_ff - FF_ESCAPE_RATE * dt, HOVER_FF_MIN)
-        if int(before * 100) != int(hover_ff * 100):
-            log.info("feedforward -> %.3f (%s saturated)", hover_ff,
-                     "high" if hover_ff > before else "low")
-
         phase = "climb" if t_reached is None else "hover"
-        rec.row(link, phase, alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
-                err_m=err_m, climb_sp=climb_sp, climb=climb,
-                thrust=thrust, th_p=th_p, th_i=th_i, hover_ff=hover_ff)
+        alt, err_m, offset = control_step(link, rec, est, pi, args, hover_ff,
+                                          phase, dt)
+        # After control_step, so the limits see this pass's sample, not the last.
+        check_watchdogs(link, est.raw, args.alt, elapsed,
+                        timeout=t_reached is None)
+        hover_ff = hunt.update(hover_ff, pi, offset, err_m, dt)
 
-        # Time-based, not altitude-based. Whatever height it has reached when
-        # the climb window closes, we move on and hold it -- a short climb is
-        # something for the pilot to judge, not grounds for disarming.
+        # Time-based, not altitude-based. Whatever height it has when the climb
+        # window closes, we hold that -- a short climb is for the pilot to
+        # judge, not grounds for disarming.
         if t_reached is None:
             if elapsed >= climb_until:
                 t_reached = now
@@ -733,41 +565,51 @@ def run_fly(link, rec, args):
                     log.warning("still %.2fm off target -- holding anyway",
                                 abs(err_m))
         elif now - t_reached >= args.hover:
-            break
+            return hover_ff
 
         time.sleep(period)
 
-    # The script does not land. It holds the hover and waits for the pilot to
-    # take over on the transmitter -- AUTO.LAND has never been exercised on this
-    # airframe, and PX4's altitude here is valid but drifts metres with no
-    # horizontal aiding. Holding also keeps COM_OF_LOSS_T fed, so PX4 does not
-    # fire its own offboard-loss failsafe while you reach for the sticks.
+
+def hold_for_pilot(link, rec, est, pi, args, hover_ff):
+    """Hold the hover indefinitely and wait for the pilot to take the TX.
+
+    The script never lands: AUTO.LAND has never been exercised on this airframe,
+    and PX4's altitude here is valid but drifts metres with no horizontal
+    aiding. Holding also keeps COM_OF_LOSS_T fed, so PX4 does not fire its own
+    offboard-loss failsafe while you reach for the sticks.
+    """
     log.warning("HOVER COMPLETE -- holding. TAKE OVER WITH THE TRANSMITTER.")
-    t_nag = time.monotonic()
+    period = 1.0 / LOOP_HZ
+    prev_t = t_nag = time.monotonic()
 
     while True:
-        if not link.in_offboard:
-            raise PilotControl("vehicle left OFFBOARD (now %s)" % link.mode_name)
-
         now = time.monotonic()
         dt = max(now - prev_t, 1e-3)
         prev_t = now
 
-        alt, climb = est.step(link.press_hpa, dt)
-        check_watchdogs(link, est.raw, args.alt, 0.0, timeout=False)
+        if not link.in_offboard:
+            raise PilotControl("vehicle left OFFBOARD (now %s)" % link.mode_name)
 
-        err_m = args.alt - alt
-        climb_sp = clamp(args.kp_alt * err_m, -MAX_DESCENT_MPS, MAX_CLIMB_MPS)
-        offset, th_p, th_i = pi.step(climb_sp - climb, dt)
-        link.set_rates(thrust=hover_ff + offset)
-        rec.row(link, "handover", alt_sp=args.alt, alt_raw=est.raw, alt_filt=alt,
-                err_m=err_m, climb_sp=climb_sp, climb=climb,
-                thrust=hover_ff + offset, th_p=th_p, th_i=th_i, hover_ff=hover_ff)
+        alt, _, _ = control_step(link, rec, est, pi, args, hover_ff,
+                                 "handover", dt)
+        check_watchdogs(link, est.raw, args.alt, 0.0, timeout=False)
 
         if now - t_nag > 5.0:
             log.warning("still holding at %.2fm -- take over on the TX", alt)
             t_nag = now
         time.sleep(period)
+
+
+def run_fly(link, rec, args):
+    """Take off on the barometer alone, then hand the aircraft to the pilot."""
+    ref_hpa = take_reference(link)
+    engage_offboard(link)
+
+    est = AltEstimator(ref_hpa, link.press_hpa)
+    pi = ClimbPi(args.kp_climb, args.ki_climb, 0.0, 0.0)
+
+    hover_ff = climb_and_hover(link, rec, est, pi, args)
+    hold_for_pilot(link, rec, est, pi, args, hover_ff)
 
 
 def setup_logging(run_dir, verbose=False):
@@ -789,15 +631,11 @@ def setup_logging(run_dir, verbose=False):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=("dry", "bench", "fly"), default="dry",
-                   help="dry: stream only, never arms. bench: props-off thrust "
-                        "ramp. fly: closed-loop takeoff.")
     p.add_argument("--conn", default=CONN)
     p.add_argument("--alt", type=float, default=TARGET_ALT_M, metavar="M")
     p.add_argument("--climb-s", type=float, default=CLIMB_S, metavar="S",
                    help="seconds to climb before the hover timer starts")
     p.add_argument("--hover", type=float, default=HOVER_S, metavar="S")
-    p.add_argument("--dry-seconds", type=float, default=15.0, metavar="S")
     p.add_argument("--kp-alt", type=float, default=KP_ALT, metavar="PER_S")
     p.add_argument("--kp-climb", type=float, default=KP_CLIMB, metavar="THR_PER_MPS")
     p.add_argument("--ki-climb", type=float, default=KI_CLIMB, metavar="THR_PER_M")
@@ -805,7 +643,7 @@ def parse_args():
                    help="feedforward the ramp targets; measured hover thrust")
     p.add_argument("--out", default=None, metavar="DIR")
     p.add_argument("--force-low-alt", action="store_true",
-                   help="allow --mode fly below %.1fm (overshoot may trip the "
+                   help="allow a target below %.1fm (overshoot may trip the "
                         "watchdog in flight)" % MIN_FLY_ALT_M)
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -819,15 +657,15 @@ def main():
         "runs", "baro_takeoff_" + time.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
     setup_logging(run_dir, args.verbose)
-    log.info("mode=%s alt=%.2fm run_dir=%s", args.mode, args.alt, run_dir)
+    log.info("alt=%.2fm run_dir=%s", args.alt, run_dir)
     log.info("gains kp_alt=%.3f kp_climb=%.3f ki_climb=%.3f "
              "baro_tau=%.2fs climb_tau=%.2fs hover_ff=%.3f",
              args.kp_alt, args.kp_climb, args.ki_climb, BARO_TAU_S, CLIMB_TAU_S,
              args.hover_ff)
 
-    if args.mode == "fly" and args.alt < MIN_FLY_ALT_M and not args.force_low_alt:
+    if args.alt < MIN_FLY_ALT_M and not args.force_low_alt:
         raise SystemExit(
-            "Refusing --mode fly below %.1fm.\n"
+            "Refusing a target below %.1fm.\n"
             "Takeoff overshoot is about 0.7m whatever the target, because baro\n"
             "liftoff detection is ~1s late and the aircraft is already climbing\n"
             "at over 1 m/s at handover. In sim, %.1fm trips the %.1fm overshoot\n"
@@ -835,10 +673,8 @@ def main():
             "Use --alt 2.5, or --force-low-alt if you accept that risk."
             % (MIN_FLY_ALT_M, args.alt, ALT_OVERSHOOT_M))
 
-    if args.mode != "dry":
-        log.warning("%s mode ARMS THE VEHICLE. Props off for bench. 5s to abort.",
-                    args.mode)
-        time.sleep(5.0)
+    log.warning("THIS ARMS THE VEHICLE AND TAKES OFF. 5s to abort.")
+    time.sleep(5.0)
 
     link = Link(args.conn)
     rec = None
@@ -849,7 +685,7 @@ def main():
         wait_for_telemetry(link)
 
         rec = Recorder(run_dir)
-        {"dry": run_dry, "bench": run_bench, "fly": run_fly}[args.mode](link, rec, args)
+        run_fly(link, rec, args)
 
     except PilotControl as exc:
         log.info("%s -- pilot has the aircraft; leaving it armed", exc)
