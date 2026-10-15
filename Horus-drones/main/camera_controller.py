@@ -123,7 +123,10 @@ map is shifted to match, so it survives a pan.
 STEP 5, PAIRING. When both a marker and a white LED are visible, they pair
 only if they are close together. Every true pair measured 24.5-41.9 px apart;
 every false one (marker matched to a distant ceiling light) measured 64-122.
-PAIR_MAX_PX at 60 splits them.
+PAIR_MAX_PX at 60 split them -- but that was measured at HFOV 24.3, and the
+field is now 62.2, which divides every separation by 2.56: true pairs land
+9.6-16.4 px and false ones 25-48, so 60 no longer separates them. Re-measure
+before trusting a pair lock or sep_px as range.
 
 WHAT IT SCORED ON REAL FOOTAGE
     run_20260925_173212 (red marker):  10 pair + 102 marker-only of 714 frames
@@ -220,8 +223,8 @@ PAIR_MIN_PX   = 3.0     # below this they are one blob, not two LEDs
 # false pair (a red LED matched to a ceiling light) measured 64-122. 60 px
 # splits them with room to spare. Set it from your own airframe if you prefer:
 #   sep_px = baseline_m / range_m * (width_px/2) / tan(HFOV/2)
-# which for 640 px and HFOV 24.3 deg is baseline/range * 1486, so a 0.15 m
-# baseline is 60 px at 3.7 m and shrinks beyond that. The cap is therefore also
+# which for 640 px and HFOV 62.2 deg is baseline/range * 530, so a 0.15 m
+# baseline is 60 px at 1.3 m and shrinks beyond that. The cap is therefore also
 # a statement about the closest range you expect to lock at.
 PAIR_MAX_PX   = 60.0    # above this they are unrelated lights
 REQUIRE_PAIR  = False   # True = never report a red-only lock

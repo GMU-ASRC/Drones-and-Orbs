@@ -70,7 +70,7 @@ ALT_TOL_M         = 0.5     # "reached altitude" threshold. PX4 settles a
                             # a tight tolerance times out a climb that in fact
                             # finished.
 SEARCH_YAW_RATE   = 10.0    # deg/s while sweeping for the first lock (proven).
-                            # The 24.3 deg FOV takes 2.4 s to cross at this
+                            # The 62.2 deg FOV takes 6.2 s to cross at this
                             # rate, so a target sits in shot for plenty of
                             # frames even at the ~10 fps this detector really
                             # runs at on a Zero 2W.

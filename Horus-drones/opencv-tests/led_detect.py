@@ -95,8 +95,15 @@ import numpy as np
 PROC_RES   = (640, 480)     # detection resolution
 TARGET_FPS = 30
 
-HFOV_DEG   = 24.3           # optical FOV of the configured field (deg)
-VFOV_DEG   = 19.0
+# Pinned because libcamera otherwise picks the smallest sensor mode that
+# satisfies PROC_RES -- on the IMX219 that is a 1280x960 crop, 39% of the array,
+# which cost 2.56x the field for nothing. This mode is the full array, 2x2
+# binned; the ISP downscales it to PROC_RES in hardware, so the field is free.
+SENSOR_MODE = (1640, 1232)
+
+HFOV_DEG   = 62.2           # IMX219 full-array field. Valid only while
+VFOV_DEG   = 48.8           # SENSOR_MODE spans the whole array -- re-check with
+                            # opencv-tests/fov_probe.py if either changes.
 
 # --- blob extraction ---
 # Threshold = max(ABS_MIN_V, bg_mean + NOISE_SIGMAS*bg_sigma, REL_FRAC*peak).
@@ -198,6 +205,7 @@ class PiCamSource:
         # picamera2's "RGB888" is BGR in memory, which is what OpenCV wants.
         self.picam2.configure(self.picam2.create_video_configuration(
             main={"size": res, "format": "RGB888"},
+            raw={"size": SENSOR_MODE},
             controls={"FrameDurationLimits": (fd, fd)},
             buffer_count=4,
         ))
